@@ -1,24 +1,53 @@
-.env
-.mcp.json
+# ── Python ──────────────────────────────────────────
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.so
+.Python
 .venv/
 venv/
+env/
+
+# ── Test / build ─────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.eggs/
+*.egg-info/
 build/
 dist/
-*.spec
-*.egg-info/
-.pytest_cache/
-snipai_history.db
+*.spec.bak
 
-# Logs
-*.log
-# Backend venv/cache
-backend/__pycache__/
-backend/**/__pycache__/
-# History DB
+# ── App runtime state ──────────────────────────────
 *.db
-# Windows junk
-Thumbs.db
+*.log
+*.err.log
+*.sqlite*
+*.pid
+
+# ── Secrets / local config ──────────────────────────
+.env
+.env.local
+.env.*.local
+.mcp.json
+.claude/settings.local.json
+.openclaude/
+.claude/
+
+# ── OS junk ─────────────────────────────────────────
 .DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ── Editor / IDE ────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.iml
+*~
+
+# ── Project specific ────────────────────────────────
+my_project_claude.txt
