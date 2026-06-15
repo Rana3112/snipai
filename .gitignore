@@ -1,0 +1,24 @@
+.env
+.mcp.json
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.egg-info/
+.pytest_cache/
+snipai_history.db
+
+# Logs
+*.log
+# Backend venv/cache
+backend/__pycache__/
+backend/**/__pycache__/
+# History DB
+*.db
+# Windows junk
+Thumbs.db
+.DS_Store
