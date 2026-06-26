@@ -334,12 +334,6 @@ class ResponseWindow(QWidget):
         hist_scroll.setWidget(self._hist_container)
         s.addWidget(hist_scroll, 1)
 
-        # Pro plan card
-        s.addWidget(self._build_pro_card(), 0)
-
-        # Profile row
-        s.addWidget(self._build_profile_row(), 0)
-
         # Footer buttons
         footer = QHBoxLayout()
         footer.setSpacing(4)
@@ -358,34 +352,6 @@ class ResponseWindow(QWidget):
         footer.addStretch(1)
         s.addLayout(footer)
         return sidebar
-
-    def _build_pro_card(self) -> QFrame:
-        card = QFrame(objectName="pro_card")
-        c = QVBoxLayout(card)
-        c.setContentsMargins(14, 12, 14, 12)
-        c.setSpacing(6)
-        c.addWidget(QLabel("Snip AI Pro", objectName="pro_title"))
-        c.addWidget(QLabel("Unlimited snips & priority models", objectName="pro_sub"))
-        btn = QPushButton("Manage Plan", objectName="pro_btn")
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        c.addWidget(btn)
-        return card
-
-    def _build_profile_row(self) -> QFrame:
-        row = QFrame(objectName="profile_row")
-        r = QHBoxLayout(row)
-        r.setContentsMargins(4, 10, 4, 0)
-        r.setSpacing(10)
-        avatar = QLabel("AD", objectName="profile_avatar")
-        avatar.setFixedSize(34, 34)
-        avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        r.addWidget(avatar, 0)
-        meta = QVBoxLayout()
-        meta.setSpacing(0)
-        meta.addWidget(QLabel("Aman D.", objectName="profile_name"))
-        meta.addWidget(QLabel("Pro Plan", objectName="profile_role"))
-        r.addLayout(meta, 1)
-        return row
 
     # ── Chat area ───────────────────────────────────────────
     def _build_chat_area(self, png: bytes) -> QWidget:
@@ -514,12 +480,20 @@ class ResponseWindow(QWidget):
 
         bar = QHBoxLayout()
         bar.setSpacing(4)
-        for glyph, tip in (("🌐", "Web search"), ("📎", "Attach"), ("🎙", "Voice")):
-            b = QPushButton(glyph, objectName="input_tool")
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setToolTip(tip)
-            b.setFixedSize(32, 32)
-            bar.addWidget(b, 0)
+
+        btn_web = QPushButton("🌐", objectName="input_tool")
+        btn_web.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_web.setToolTip("Web search")
+        btn_web.setFixedSize(32, 32)
+        bar.addWidget(btn_web, 0)
+
+        btn_attach = QPushButton("📎", objectName="input_tool")
+        btn_attach.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_attach.setToolTip("Attach image")
+        btn_attach.setFixedSize(32, 32)
+        btn_attach.clicked.connect(self._on_attach)
+        bar.addWidget(btn_attach, 0)
+
         bar.addStretch(1)
         self.btn_send = QPushButton("➤", objectName="send_btn")
         self.btn_send.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1069,6 +1043,48 @@ class ResponseWindow(QWidget):
             return
         log.info("auto_send: calling _start_worker")
         self._start_worker()
+
+    def _on_attach(self) -> None:
+        """Open a file picker, load the image, and set it as the next turn's image."""
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Attach Image", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp *.gif);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            # Convert to PNG via QImage for consistent encoding
+            img = QImage()
+            img.loadFromData(data)
+            if img.isNull():
+                raise ValueError("Could not load image")
+            import io
+            buf = io.BytesIO()
+            ba = img.bits().tobytes()
+            # Re-encode as PNG using QPixmap round-trip
+            pix = QPixmap.fromImage(img)
+            import tempfile, os
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.close()
+            pix.save(tmp.name, "PNG")
+            with open(tmp.name, "rb") as f:
+                png = f.read()
+            os.unlink(tmp.name)
+
+            self._png = png
+            self._text_mode = False
+            self._first_turn_sent = False  # allow re-sending with new image
+            import os as _os
+            fname = _os.path.basename(path)
+            self.chat_input.setPlaceholderText(f"Attached: {fname} — ask a question…")
+            log.info("Attached image %s (%d bytes)", fname, len(png))
+        except Exception as e:
+            log.warning("Attach failed: %s", e)
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Attach", f"Could not load image:\n{e}")
 
     def _on_send(self) -> None:
         if self._worker is not None:

@@ -104,35 +104,6 @@ def generate_stylesheet(theme: ThemeConfig) -> str:
         }}
         QPushButton#hist_item:hover {{ background: #161924; }}
 
-        QFrame#pro_card {{
-            background: #0f111d;
-            border: 1px solid rgba(139,91,255,0.25);
-            border-radius: 12px;
-        }}
-        QLabel#pro_title {{ color: #ffffff; font-size: 10pt; font-weight: 800; }}
-        QLabel#pro_sub {{ color: {t.text_secondary}; font-size: 8.5pt; }}
-        QPushButton#pro_btn {{
-            background: transparent;
-            border: 1px solid rgba(139,91,255,0.5);
-            border-radius: 9px;
-            color: #c9b8ff;
-            font-size: 9pt; font-weight: 700;
-            padding: 7px 10px;
-        }}
-        QPushButton#pro_btn:hover {{ background: rgba(139,91,255,0.12); }}
-
-        QFrame#profile_row {{
-            background: transparent;
-            border-top: 1px solid rgba(255,255,255,0.06);
-        }}
-        QLabel#profile_avatar {{
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                stop:0 #3b82f6, stop:1 #2563eb);
-            color: #ffffff; font-size: 9pt; font-weight: 800;
-            border-radius: 17px;
-        }}
-        QLabel#profile_name {{ color: #ffffff; font-size: 9.5pt; font-weight: 700; }}
-        QLabel#profile_role {{ color: {t.text_secondary}; font-size: 8pt; }}
         QPushButton#footer_btn {{
             background: transparent; border: none;
             color: {t.text_secondary}; font-size: 12pt; padding: 4px;
