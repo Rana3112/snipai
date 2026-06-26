@@ -6,18 +6,19 @@ Auto-send on open: cropped image + dynamic default prompt fired immediately.
 """
 from __future__ import annotations
 import logging
+import time
 from PySide6.QtCore import (
     Qt, QPoint, QRect, Signal, Slot, QSize, QTimer,
     QPropertyAnimation, QEasingCurve,
 )
 from PySide6.QtGui import (
     QGuiApplication, QMouseEvent, QPixmap, QImage, QClipboard, QKeyEvent,
-    QColor, QPainter, QPalette,
+    QColor, QPainter, QPalette, QCursor,
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextBrowser, QPushButton,
     QApplication, QFrame, QGraphicsDropShadowEffect, QTextEdit,
-    QComboBox, QScrollArea, QCheckBox,
+    QComboBox, QScrollArea, QCheckBox, QMenu, QSizePolicy, QSizeGrip,
 )
 
 from ..api.worker import (
@@ -94,31 +95,47 @@ class _ChatInput(QTextEdit):
 
 
 class _MessageRow(QFrame):
-    """One conversation turn: role label + markdown content. Auto-sizes height."""
+    """One conversation turn: avatar column + (name/time, body, actions). Auto-sizes."""
 
     def __init__(self, role: str, parent=None):
         super().__init__(parent)
         self.role = role  # "user" | "assistant"
         self.setObjectName("user_row" if role == "user" else "assistant_row")
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 12, 16, 12)
-        lay.setSpacing(7)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(20, 14, 20, 14)
+        lay.setSpacing(12)
 
-        # ── Role header (avatar dot + name) ──────────────────
+        # ── Avatar column ────────────────────────────────────
+        self.avatar = QLabel()
+        self.avatar.setFixedSize(32, 32)
+        self.avatar.setObjectName("row_avatar_user" if role == "user" else "row_avatar_ai")
+        self.avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.avatar.setText("AD" if role == "user" else "✦")
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignTop)
+        col.addStretch(1)
+        lay.addLayout(col, 0)
+
+        # ── Content column ───────────────────────────────────
+        content = QVBoxLayout()
+        content.setSpacing(4)
+
         head = QHBoxLayout()
         head.setSpacing(8)
-        dot = QLabel()
-        dot.setFixedSize(20, 20)
-        dot.setObjectName("avatar_user" if role == "user" else "avatar_ai")
-        dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        dot.setText("U" if role == "user" else "AI")
-        head.addWidget(dot, 0)
         name = QLabel("You" if role == "user" else "Snip AI")
-        name.setObjectName("role_name")
+        name.setObjectName("row_name")
         head.addWidget(name, 0)
+        ts = QLabel()
+        try:
+            ts.setText(time.strftime("%I:%M %p").lstrip("0"))
+        except Exception:
+            ts.setText("")
+        ts.setObjectName("row_time")
+        head.addWidget(ts, 0)
         head.addStretch(1)
-        lay.addLayout(head)
+        content.addLayout(head)
 
         # ── Markdown body ─────────────────────────────────────
         self.browser = QTextBrowser()
@@ -133,16 +150,53 @@ class _MessageRow(QFrame):
         pal.setColor(QPalette.ColorRole.Link, QColor(LINK_COLOR))
         pal.setColor(QPalette.ColorRole.Base, QColor(0, 0, 0, 0))
         self.browser.setPalette(pal)
-        lay.addWidget(self.browser)
+        content.addWidget(self.browser)
+
+        # ── Inline actions bar (assistant only) ──────────────
+        self.actions = None
+        if role == "assistant":
+            self.actions = self._build_actions()
+            content.addWidget(self.actions)
+
+        lay.addLayout(content, 1)
+
+    def _build_actions(self) -> QWidget:
+        bar = QWidget(objectName="msg_actions")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(0, 2, 0, 0)
+        h.setSpacing(2)
+        for glyph, tip in (("⧉", "Copy"), ("👍", "Good"), ("👎", "Bad"), ("🔊", "Speak"), ("⋯", "More")):
+            b = QPushButton(glyph, objectName="msg_action_btn")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(tip)
+            b.setFixedHeight(26)
+            h.addWidget(b, 0)
+            if tip == "Copy":
+                b.clicked.connect(self._copy_self)
+        h.addStretch(1)
+        export = QPushButton("Export  ▾", objectName="export_btn")
+        export.setCursor(Qt.CursorShape.PointingHandCursor)
+        menu = QMenu(export)
+        for label in ("Copy as Markdown", "Copy as Text", "Save to file"):
+            menu.addAction(label)
+        export.setMenu(menu)
+        h.addWidget(export, 0)
+        return bar
+
+    def _copy_self(self) -> None:
+        QApplication.clipboard().setText(self._raw_md)
 
     def set_markdown(self, md: str) -> None:
+        self._raw_md = md
         self.browser.setHtml(markdown_to_html(md))
         self.fit_height()
+
+    _raw_md: str = ""
 
     def fit_height(self) -> None:
         vw = self.browser.viewport().width()
         if vw <= 0:
-            vw = max(self.width() - 40, 200)
+            vw = max(self.width() - 80, 200)
         doc = self.browser.document()
         doc.setTextWidth(vw)
         h = int(doc.size().height()) + 6
@@ -152,7 +206,7 @@ class _MessageRow(QFrame):
 class ResponseWindow(QWidget):
     closed = Signal()
 
-    DEFAULT_SIZE = QSize(600, 680)
+    DEFAULT_SIZE = QSize(1020, 850)
     THUMB_MAX = 64
 
     def __init__(self, anchor: QRect, png: bytes | None = None,
@@ -191,7 +245,15 @@ class ResponseWindow(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setMinimumSize(QSize(420, 380))
         self.resize(self.DEFAULT_SIZE)
+        self.setMouseTracking(True)
+
+        # Edge-drag resize state
+        self._resize_edge: str = ""
+        self._resize_start_geo: QRect | None = None
+        self._resize_start_mouse: QPoint | None = None
+        self._RESIZE_MARGIN = 8
 
         self._build_ui(png)
         self._position_near(anchor)
@@ -211,20 +273,135 @@ class ResponseWindow(QWidget):
 
         root = QWidget(self, objectName="root")
         root.setGraphicsEffect(shadow)
+        root.setMouseTracking(True)
         outer.addWidget(root)
+        self._root = root
 
-        v = QVBoxLayout(root)
+        root_lay = QHBoxLayout(root)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.setSpacing(0)
+
+        root_lay.addWidget(self._build_sidebar(), 0)
+        root_lay.addWidget(self._build_chat_area(png), 1)
+
+    # ── Sidebar ─────────────────────────────────────────────
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QWidget(objectName="sidebar")
+        sidebar.setFixedWidth(260)
+        self._sidebar = sidebar
+        s = QVBoxLayout(sidebar)
+        s.setContentsMargins(14, 16, 14, 14)
+        s.setSpacing(12)
+
+        # Brand row
+        brand = QHBoxLayout()
+        brand.setSpacing(10)
+        logo = QLabel("✦", objectName="brand_logo")
+        logo.setFixedSize(34, 34)
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand.addWidget(logo, 0)
+        brand.addWidget(QLabel("Snip AI", objectName="brand_title"), 0)
+        brand.addStretch(1)
+        compose = QPushButton("✎", objectName="compose_btn")
+        compose.setFixedSize(32, 32)
+        compose.setCursor(Qt.CursorShape.PointingHandCursor)
+        compose.setToolTip("New chat")
+        compose.clicked.connect(self._new_chat)
+        brand.addWidget(compose, 0)
+        s.addLayout(brand)
+
+        # + New Chat button
+        new_chat = QPushButton("  +   New Chat", objectName="new_chat_btn")
+        new_chat.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_chat.setMinimumHeight(42)
+        new_chat.clicked.connect(self._new_chat)
+        nc_lay = QHBoxLayout(new_chat)
+        nc_lay.setContentsMargins(0, 0, 12, 0)
+        nc_lay.addStretch(1)
+        keycap = QLabel("Ctrl+K", objectName="keycap")
+        nc_lay.addWidget(keycap, 0)
+        s.addWidget(new_chat)
+
+        # History (scrollable, grouped)
+        hist_scroll = QScrollArea(objectName="feed_scroll")
+        hist_scroll.setWidgetResizable(True)
+        hist_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._hist_container = QWidget()
+        self._hist_layout = QVBoxLayout(self._hist_container)
+        self._hist_layout.setContentsMargins(0, 0, 0, 0)
+        self._hist_layout.setSpacing(4)
+        self._build_history()
+        hist_scroll.setWidget(self._hist_container)
+        s.addWidget(hist_scroll, 1)
+
+        # Pro plan card
+        s.addWidget(self._build_pro_card(), 0)
+
+        # Profile row
+        s.addWidget(self._build_profile_row(), 0)
+
+        # Footer buttons
+        footer = QHBoxLayout()
+        footer.setSpacing(4)
+        for glyph, tip, slot in (
+            ("☾", "Light / Dark mode", None),
+            ("⛉", "Documentation", None),
+            ("⚙", "Settings", self._open_settings),
+        ):
+            b = QPushButton(glyph, objectName="footer_btn")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(tip)
+            b.setFixedSize(36, 32)
+            if slot:
+                b.clicked.connect(slot)
+            footer.addWidget(b, 0)
+        footer.addStretch(1)
+        s.addLayout(footer)
+        return sidebar
+
+    def _build_pro_card(self) -> QFrame:
+        card = QFrame(objectName="pro_card")
+        c = QVBoxLayout(card)
+        c.setContentsMargins(14, 12, 14, 12)
+        c.setSpacing(6)
+        c.addWidget(QLabel("Snip AI Pro", objectName="pro_title"))
+        c.addWidget(QLabel("Unlimited snips & priority models", objectName="pro_sub"))
+        btn = QPushButton("Manage Plan", objectName="pro_btn")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        c.addWidget(btn)
+        return card
+
+    def _build_profile_row(self) -> QFrame:
+        row = QFrame(objectName="profile_row")
+        r = QHBoxLayout(row)
+        r.setContentsMargins(4, 10, 4, 0)
+        r.setSpacing(10)
+        avatar = QLabel("AD", objectName="profile_avatar")
+        avatar.setFixedSize(34, 34)
+        avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        r.addWidget(avatar, 0)
+        meta = QVBoxLayout()
+        meta.setSpacing(0)
+        meta.addWidget(QLabel("Aman D.", objectName="profile_name"))
+        meta.addWidget(QLabel("Pro Plan", objectName="profile_role"))
+        r.addLayout(meta, 1)
+        return row
+
+    # ── Chat area ───────────────────────────────────────────
+    def _build_chat_area(self, png: bytes) -> QWidget:
+        area = QWidget(objectName="chat_area")
+        v = QVBoxLayout(area)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
-        # ── Header ─────────────────────────────────────────
+        # ── Header (dropdown bar) ──────────────────────────
         self.header = QWidget(objectName="header")
         h = QHBoxLayout(self.header)
-        h.setContentsMargins(16, 12, 14, 12)
-        h.setSpacing(12)
+        h.setContentsMargins(18, 12, 14, 12)
+        h.setSpacing(10)
 
         self.thumb = QLabel(objectName="thumb")
-        self.thumb.setFixedSize(self.THUMB_MAX, self.THUMB_MAX)
+        self.thumb.setFixedSize(40, 40)
         self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         if self._stack_mode:
             self._set_glyph_thumb(f"{len(self._stack_items)}")
@@ -234,35 +411,26 @@ class ResponseWindow(QWidget):
             self._set_thumb(png)
         h.addWidget(self.thumb, 0)
 
-        meta = QVBoxLayout()
-        meta.setSpacing(3)
-        brand_row = QHBoxLayout()
-        brand_row.setSpacing(8)
-        subtitle = QLabel("SNIP AI", objectName="subtitle")
-        brand_row.addWidget(subtitle, 0)
-        brand_row.addStretch(1)
-
         self.mode_select = QComboBox()
-        self.mode_select.setObjectName("model_select")
+        self.mode_select.setObjectName("mode_select")
         self.mode_select.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.mode_select.setMinimumWidth(96)
         self.mode_select.setToolTip("Response mode")
         for key in prompt_modes.ORDER:
-            self.mode_select.addItem(prompt_modes.get_mode(key).label, key)
+            self.mode_select.addItem("✦  " + prompt_modes.get_mode(key).label, key)
         idx = self.mode_select.findData(self._mode_key)
         if idx >= 0:
             self.mode_select.setCurrentIndex(idx)
         self.mode_select.currentIndexChanged.connect(self._on_mode_changed)
-        brand_row.addWidget(self.mode_select, 0)
+        h.addWidget(self.mode_select, 0)
 
         self.model_select = QComboBox()
         self.model_select.setObjectName("model_select")
         self.model_select.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.model_select.setMinimumWidth(160)
-        self.model_select.setMaximumWidth(220)
-        self.model_select.addItem(self._current_model)
+        self.model_select.setMinimumWidth(170)
+        self.model_select.setMaximumWidth(240)
+        self.model_select.addItem("∞  " + self._current_model)
         self.model_select.currentTextChanged.connect(self._on_model_changed)
-        brand_row.addWidget(self.model_select, 0)
+        h.addWidget(self.model_select, 0)
 
         self.provider_badge = QLabel("")
         self.provider_badge.setObjectName("provider_badge")
@@ -273,39 +441,26 @@ class ResponseWindow(QWidget):
         )
         self.provider_badge.setVisible(False)
         self.provider_badge.setToolTip("Active provider (auto-rotates on failure)")
-        brand_row.addWidget(self.provider_badge, 0)
+        h.addWidget(self.provider_badge, 0)
+
+        h.addStretch(1)
 
         self.free_only_check = QCheckBox("Free only")
         self.free_only_check.setObjectName("free_only_check")
+        self.free_only_check.setCursor(Qt.CursorShape.PointingHandCursor)
         self.free_only_check.setChecked(self._free_only)
         self.free_only_check.setToolTip("Auto-pick a free, vision-capable model from this provider.")
         self.free_only_check.toggled.connect(self._on_free_only_toggled)
-        brand_row.addWidget(self.free_only_check, 0)
-        meta.addLayout(brand_row)
-
-        title = QLabel("Snip Chat", objectName="title")
-        meta.addWidget(title)
-        prompt_label = QLabel(
-            "Reading selected text" if self._text_mode else "Analyzing your selection",
-            objectName="prompt",
-        )
-        prompt_label.setWordWrap(True)
-        meta.addWidget(prompt_label)
-        meta.addStretch(1)
-        h.addLayout(meta, 1)
+        h.addWidget(self.free_only_check, 0)
 
         self.btn_close = QPushButton("✕", objectName="close_btn")
         self.btn_close.setFixedSize(32, 32)
         self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_close.clicked.connect(self.close)
-        h.addWidget(self.btn_close, 0, Qt.AlignmentFlag.AlignTop)
-
+        h.addWidget(self.btn_close, 0)
         v.addWidget(self.header)
-        sep = QFrame(objectName="sep")
-        sep.setFrameShape(QFrame.Shape.HLine)
-        v.addWidget(sep)
 
-        # ── Feed (scrollable message rows) ────────────────────
+        # ── Feed (scrollable message rows) ─────────────────
         self.feed_scroll = QScrollArea(objectName="feed_scroll")
         self.feed_scroll.setWidgetResizable(True)
         self.feed_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -317,10 +472,10 @@ class ResponseWindow(QWidget):
         self.feed_scroll.setWidget(self.feed)
         v.addWidget(self.feed_scroll, 1)
 
-        # ── Thinking indicator ────────────────────────────────
+        # ── Thinking indicator ─────────────────────────────
         self._thinking_bar = QWidget()
         tb_layout = QHBoxLayout(self._thinking_bar)
-        tb_layout.setContentsMargins(18, 4, 18, 4)
+        tb_layout.setContentsMargins(20, 4, 20, 4)
         tb_layout.setSpacing(8)
         self._dots = _ThinkingDots()
         tb_layout.addWidget(self._dots)
@@ -331,55 +486,149 @@ class ResponseWindow(QWidget):
         v.addWidget(self._thinking_bar)
         self._thinking_bar.hide()
 
-        # ── Status bar ────────────────────────────────────────
+        # ── Status bar ──────────────────────────────────────
         self._status_bar = QWidget()
         sb_layout = QHBoxLayout(self._status_bar)
-        sb_layout.setContentsMargins(18, 4, 18, 4)
+        sb_layout.setContentsMargins(20, 4, 20, 4)
         self._status_label = QLabel("", objectName="status")
         sb_layout.addWidget(self._status_label)
         sb_layout.addStretch(1)
         v.addWidget(self._status_bar)
         self._status_bar.hide()
 
-        # ── Chat input ────────────────────────────────────────
-        sep_chat = QFrame(objectName="sep")
-        sep_chat.setFrameShape(QFrame.Shape.HLine)
-        v.addWidget(sep_chat)
+        # ── Input container ────────────────────────────────
+        input_wrap = QWidget()
+        iw = QVBoxLayout(input_wrap)
+        iw.setContentsMargins(20, 6, 20, 6)
+        iw.setSpacing(6)
 
-        chat_row = QWidget()
-        chat_layout = QHBoxLayout(chat_row)
-        chat_layout.setContentsMargins(14, 12, 14, 12)
-        chat_layout.setSpacing(8)
+        container = QFrame(objectName="input_container")
+        cv = QVBoxLayout(container)
+        cv.setContentsMargins(14, 10, 10, 8)
+        cv.setSpacing(4)
+
         self.chat_input = _ChatInput()
         self.chat_input.setObjectName("chat_input")
         self.chat_input.submitted.connect(self._on_send)
-        chat_layout.addWidget(self.chat_input, 1)
+        cv.addWidget(self.chat_input)
 
-        self.btn_send = QPushButton("Send  →", objectName="primary")
+        bar = QHBoxLayout()
+        bar.setSpacing(4)
+        for glyph, tip in (("🌐", "Web search"), ("📎", "Attach"), ("🎙", "Voice")):
+            b = QPushButton(glyph, objectName="input_tool")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(tip)
+            b.setFixedSize(32, 32)
+            bar.addWidget(b, 0)
+        bar.addStretch(1)
+        self.btn_send = QPushButton("➤", objectName="send_btn")
         self.btn_send.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_send.setFixedHeight(48)
+        self.btn_send.setFixedSize(34, 34)
         self.btn_send.clicked.connect(self._on_send)
-        chat_layout.addWidget(self.btn_send)
-        v.addWidget(chat_row)
+        bar.addWidget(self.btn_send, 0)
+        cv.addLayout(bar)
+        iw.addWidget(container)
 
-        # ── Footer ────────────────────────────────────────────
-        sep2 = QFrame(objectName="sep")
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        v.addWidget(sep2)
+        disclaimer = QLabel(
+            "Snip AI can make mistakes. Verify important information.",
+            objectName="disclaimer",
+        )
+        disclaimer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        iw.addWidget(disclaimer)
+        v.addWidget(input_wrap)
+        return area
 
-        footer = QHBoxLayout()
-        footer.setContentsMargins(14, 10, 14, 14)
-        footer.setSpacing(8)
-        footer.addStretch(1)
-        self.btn_copy = QPushButton("  Copy")
-        self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_copy.clicked.connect(self._copy)
-        footer.addWidget(self.btn_copy)
-        self.btn_done = QPushButton("Done", objectName="primary")
-        self.btn_done.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_done.clicked.connect(self.close)
-        footer.addWidget(self.btn_done)
-        v.addLayout(footer)
+    # ── Sidebar history ─────────────────────────────────────
+    def _build_history(self) -> None:
+        from datetime import date
+        while self._hist_layout.count():
+            item = self._hist_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        recs = store.recent(15)
+        if not recs:
+            self._hist_layout.addWidget(QLabel("No history yet", objectName="hist_header"))
+            self._hist_layout.addStretch(1)
+            return
+
+        today = date.today()
+        order = ["Today", "Yesterday", "Previous 7 Days", "Older"]
+        buckets: dict[str, list] = {name: [] for name in order}
+        for rec in recs:
+            try:
+                delta = (today - date.fromtimestamp(rec.ts)).days
+            except Exception:
+                delta = 999
+            if delta <= 0:
+                buckets["Today"].append(rec)
+            elif delta == 1:
+                buckets["Yesterday"].append(rec)
+            elif delta <= 7:
+                buckets["Previous 7 Days"].append(rec)
+            else:
+                buckets["Older"].append(rec)
+
+        for name in order:
+            lst = buckets[name]
+            if not lst:
+                continue
+            self._hist_layout.addWidget(QLabel(name.upper(), objectName="hist_header"))
+            for rec in lst:
+                raw = (rec.question or rec.selected_text or rec.answer or "Untitled")
+                label = raw.strip().replace("\n", " ")
+                if len(label) > 34:
+                    label = label[:34] + "…"
+                btn = QPushButton(label, objectName="hist_item")
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setToolTip(raw.strip()[:200])
+                btn.clicked.connect(lambda _=False, r=rec: self._load_history_item(r))
+                self._hist_layout.addWidget(btn)
+        self._hist_layout.addStretch(1)
+
+    def _reset_feed(self) -> None:
+        for row in self._rows:
+            self.feed_layout.removeWidget(row)
+            row.deleteLater()
+        self._rows = []
+        self._clear_actions()
+        self._active_row = None
+        self._current_buf = ""
+        self._thinking_bar.hide()
+        self._status_bar.hide()
+        self.chat_input.setEnabled(True)
+        self.btn_send.setEnabled(True)
+
+    def _new_chat(self) -> None:
+        if self._worker is not None:
+            return
+        self._reset_feed()
+        self._last_assistant = ""
+        self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._first_turn_sent = True  # don't auto-resend the original crop
+        self.chat_input.setFocus()
+
+    def _load_history_item(self, rec) -> None:
+        if self._worker is not None:
+            return
+        self._reset_feed()
+        q = (rec.question or rec.selected_text or "").strip()
+        self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if q:
+            self._add_row("user", q)
+            self._messages.append({"role": "user", "content": q})
+        if rec.answer:
+            self._add_row("assistant", rec.answer)
+            self._messages.append({"role": "assistant", "content": rec.answer})
+            self._last_assistant = rec.answer
+        self._first_turn_sent = True
+        self.chat_input.setFocus()
+
+    def _open_settings(self) -> None:
+        from .settings_panel import SettingsPanel
+        dlg = SettingsPanel(self)
+        dlg.exec()
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -387,8 +636,28 @@ class ResponseWindow(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
+        self._scale_content()
         for row in self._rows:
             row.fit_height()
+
+    def _scale_content(self) -> None:
+        """Scale sidebar width + base font with the window so content shrinks/grows."""
+        w = self.width()
+        # Sidebar: 200px at min width, 300px at large; hidden under 540px.
+        sb = getattr(self, "_sidebar", None)
+        if sb is not None:
+            if w < 540:
+                sb.setVisible(False)
+            else:
+                sb.setVisible(True)
+                sb_w = max(200, min(300, int(w * 0.26)))
+                sb.setFixedWidth(sb_w)
+        # Base font scales 9pt (narrow) → 11pt (wide) across 640..1100px.
+        f = max(9.0, min(11.0, 9.0 + (w - 640) / 230.0))
+        font = self.font()
+        if abs(font.pointSizeF() - f) > 0.1:
+            font.setPointSizeF(f)
+            self.setFont(font)
 
     def _set_thumb(self, png: bytes) -> None:
         dpr = float(QGuiApplication.primaryScreen().devicePixelRatio()) or 1.0
@@ -696,6 +965,7 @@ class ResponseWindow(QWidget):
 
         self._render_actions(answer)
         self._save_history(answer)
+        self._build_history()
 
         self.chat_input.setEnabled(True)
         self.btn_send.setEnabled(True)
@@ -831,23 +1101,96 @@ class ResponseWindow(QWidget):
         self._start_worker()
 
     # ── Header drag ────────────────────────────────────────
+    # ── Edge-drag resize + header drag ─────────────────────
+    def _edge_at(self, pos: QPoint) -> str:
+        """Return which edge/corner the point is on, within the resize margin."""
+        m = self._RESIZE_MARGIN
+        r = self.rect()
+        # Account for the 12px translucent outer margin around #root.
+        ox = oy = 12
+        left = pos.x() <= ox + m
+        right = pos.x() >= r.width() - ox - m
+        top = pos.y() <= oy + m
+        bottom = pos.y() >= r.height() - oy - m
+        # Only within the visible root area.
+        if pos.x() < ox - m or pos.x() > r.width() - ox + m:
+            return ""
+        if pos.y() < oy - m or pos.y() > r.height() - oy + m:
+            return ""
+        v = "top" if top else ("bottom" if bottom else "")
+        h = "left" if left else ("right" if right else "")
+        return (v + h) if (v or h) else ""
+
+    _CURSORS = {
+        "left": Qt.CursorShape.SizeHorCursor, "right": Qt.CursorShape.SizeHorCursor,
+        "top": Qt.CursorShape.SizeVerCursor, "bottom": Qt.CursorShape.SizeVerCursor,
+        "topleft": Qt.CursorShape.SizeFDiagCursor, "bottomright": Qt.CursorShape.SizeFDiagCursor,
+        "topright": Qt.CursorShape.SizeBDiagCursor, "bottomleft": Qt.CursorShape.SizeBDiagCursor,
+    }
+
     def mousePressEvent(self, e: QMouseEvent) -> None:
         if e.button() == Qt.MouseButton.LeftButton:
-            if self.header.geometry().contains(e.position().toPoint()):
+            edge = self._edge_at(e.position().toPoint())
+            if edge:
+                self._resize_edge = edge
+                self._resize_start_geo = self.geometry()
+                self._resize_start_mouse = e.globalPosition().toPoint()
+                e.accept()
+                return
+            top_left = self.header.mapTo(self, QPoint(0, 0))
+            header_rect = QRect(top_left, self.header.size())
+            if header_rect.contains(e.position().toPoint()):
                 self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
                 e.accept()
                 return
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
+        # Active resize drag.
+        if self._resize_edge and (e.buttons() & Qt.MouseButton.LeftButton):
+            self._do_resize(e.globalPosition().toPoint())
+            e.accept()
+            return
+        # Active window drag.
         if self._drag_offset is not None and (e.buttons() & Qt.MouseButton.LeftButton):
             self.move(e.globalPosition().toPoint() - self._drag_offset)
             e.accept()
             return
+        # Hover: update cursor near edges.
+        if not (e.buttons() & Qt.MouseButton.LeftButton):
+            edge = self._edge_at(e.position().toPoint())
+            self.setCursor(self._CURSORS.get(edge, Qt.CursorShape.ArrowCursor))
         super().mouseMoveEvent(e)
+
+    def _do_resize(self, gpos: QPoint) -> None:
+        geo = QRect(self._resize_start_geo)
+        dx = gpos.x() - self._resize_start_mouse.x()
+        dy = gpos.y() - self._resize_start_mouse.y()
+        minw = self.minimumWidth()
+        minh = self.minimumHeight()
+        edge = self._resize_edge
+        if "left" in edge:
+            new_left = geo.left() + dx
+            if geo.right() - new_left + 1 < minw:
+                new_left = geo.right() - minw + 1
+            geo.setLeft(new_left)
+        if "right" in edge:
+            geo.setWidth(max(minw, geo.width() + dx))
+        if "top" in edge:
+            new_top = geo.top() + dy
+            if geo.bottom() - new_top + 1 < minh:
+                new_top = geo.bottom() - minh + 1
+            geo.setTop(new_top)
+        if "bottom" in edge:
+            geo.setHeight(max(minh, geo.height() + dy))
+        self.setGeometry(geo)
 
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
         self._drag_offset = None
+        self._resize_edge = ""
+        self._resize_start_geo = None
+        self._resize_start_mouse = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         super().mouseReleaseEvent(e)
 
     def keyPressEvent(self, e: QKeyEvent) -> None:
@@ -859,10 +1202,3 @@ class ResponseWindow(QWidget):
     def closeEvent(self, e):
         self.closed.emit()
         super().closeEvent(e)
-
-    # ── Actions ────────────────────────────────────────────
-    def _copy(self) -> None:
-        cb: QClipboard = QApplication.clipboard()
-        cb.setText(self._last_assistant or "")
-        self.btn_copy.setText("  Copied!")
-        QTimer.singleShot(2000, lambda: self.btn_copy.setText("  Copy"))

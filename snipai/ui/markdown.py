@@ -71,10 +71,25 @@ def _split_table_block(lines: list[str]) -> list[list[str]]:
     return rows
 
 
+_RELEVANCE_RE = re.compile(r"^\*{0,2}Relevance:?\*{0,2}\s*", re.IGNORECASE)
+
+
 def _format_block(text: str) -> str:
     text = text.strip()
     if not text:
         return ""
+
+    # Relevance callout — paragraphs starting with "Relevance:" or "**Relevance:**"
+    rel_match = _RELEVANCE_RE.match(text)
+    if rel_match:
+        body = text[rel_match.end():].strip()
+        return (
+            "<div class='snip-callout'>"
+            "<span class='snip-callout-icon'>&#10022;</span>"
+            "<span class='snip-callout-label'>Relevance</span> "
+            f"<span class='snip-callout-text'>{_format_inline(body)}</span>"
+            "</div>"
+        )
 
     # Code fence
     lines = text.splitlines()

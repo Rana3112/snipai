@@ -37,7 +37,7 @@ def build():
         sys.executable, "-m", "PyInstaller",
         "--name", APP_NAME,
         "--onefile",         # single .exe
-        "--windowed",        # no console window
+        "--console",         # show console window for debugging
         "--noconfirm",
         "--clean",
         # Hidden imports for things PyInstaller may miss

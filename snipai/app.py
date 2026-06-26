@@ -94,8 +94,19 @@ class SnipAIApp(QObject):
         self.text_hotkey = HotkeyListener(config.TEXT_HOTKEY)
         self.hotkey.triggered.connect(self.on_snip)
         self.text_hotkey.triggered.connect(self.on_text_snip)
-        self.hotkey.start()
-        self.text_hotkey.start()
+        failed = []
+        for listener, name in [(self.hotkey, config.HOTKEY), (self.text_hotkey, config.TEXT_HOTKEY)]:
+            try:
+                listener.start()
+                log.info("Hotkey registered: %s", name)
+            except RuntimeError as e:
+                log.error("Hotkey registration failed: %s", e)
+                failed.append(str(e))
+        if failed:
+            self.tray.notify(
+                "SnipAI — hotkey conflict",
+                "\n".join(failed[:2]) + "\nUse tray menu or change hotkeys in Settings.",
+            )
 
     # ── Guards ──
     def _ready(self) -> bool:
@@ -374,11 +385,7 @@ class SnipAIApp(QObject):
 
 
 def run() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    # Also log to file so the windowed (--windowed) build captures errors.
+    handlers = []
     try:
         from pathlib import Path
         log_path = Path.home() / ".snipai" / "snipai.log"
@@ -387,9 +394,24 @@ def run() -> int:
         file_h.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)s %(name)s: %(message)s"
         ))
-        logging.getLogger().addHandler(file_h)
+        handlers.append(file_h)
     except Exception:
         pass
+
+    if sys.stderr is not None and hasattr(sys.stderr, "write"):
+        try:
+            stream_h = logging.StreamHandler(sys.stderr)
+            stream_h.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s: %(message)s"
+            ))
+            handlers.append(stream_h)
+        except Exception:
+            pass
+
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=handlers,
+    )
     from PySide6.QtWidgets import QSystemTrayIcon
 
     qapp = QApplication(sys.argv)

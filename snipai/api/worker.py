@@ -198,6 +198,15 @@ class GeminiWorker(QThread):
             default = config.custom_provider_default_model(pid)
             if default and default not in blocked_models:
                 return default
+            return None
+        # Preset provider: if no free-vision model is cached (e.g. the models
+        # list failed to fetch), fall back to the explicitly chosen model for
+        # the active provider, then to the configured default. This prevents a
+        # false "no providers configured" failure when a valid API key exists.
+        if pid == self.provider_id and self.model and self.model not in blocked_models:
+            return self.model
+        if pid == self.provider_id and config.MODEL and config.MODEL not in blocked_models:
+            return config.MODEL
         return None
 
     def _candidates_in_order(self, blocked_providers: set[str],
