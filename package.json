@@ -1,0 +1,34 @@
+{
+  "name": "snippai",
+  "version": "1.0.0",
+  "description": "SnipAI — AI Screen Assistant for Windows. Press hotkey, drag to select any screen region, get instant AI analysis. Free search via TinyFish (Monid).",
+  "author": "Rana3112",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rana3112/snipai.git"
+  },
+  "homepage": "https://github.com/Rana3112/snipai#readme",
+  "keywords": ["ai", "screen-capture", "snipping-tool", "vision", "groq", "openrouter", "nvidia", "monid", "tinyfish"],
+  "engines": {
+    "node": ">=14"
+  },
+  "bin": {
+    "snippai": "./bin/snippai.js",
+    "snipai": "./bin/snippai.js"
+  },
+  "scripts": {
+    "postinstall": "node ./scripts/postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "install.ps1",
+    "install.sh",
+    "snipai/",
+    "backend/",
+    "requirements.txt",
+    "README.md"
+  ],
+  "preferGlobal": true
+}

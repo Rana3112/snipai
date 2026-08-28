@@ -26,5 +26,8 @@ if is_windowed:
 
 from snipai.app import run
 
-if __name__ == "__main__":
+def main():
     sys.exit(run())
+
+if __name__ == "__main__":
+    main()

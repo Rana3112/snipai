@@ -6,20 +6,36 @@ Press a hotkey → drag to select any region of your screen (or highlight text) 
 
 ## One-Command Install
 
-Open **PowerShell** and paste:
-
+**Windows (PowerShell) — recommended:**
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/Rana3112/snipai/main/install.ps1 | iex"
 ```
 
-That's it. The script automatically:
-- Installs Python 3.11 (via winget) if not already present
-- Installs Git if not already present
+**Any OS with Node.js — `npm` / `npx`:**
+```bash
+npm i -g snippai   # or: npm i -g snipai
+snippai            # or: snipai  — auto-installs on first run, then launches
+# without global install:
+npx snippai
+```
+
+**Any OS with Python — `pip` / `pipx`:**
+```bash
+pip install snippai   # or: pip install snipai
+snippai               # or: snipai
+# isolated (recommended):
+pipx install snippai
+# or run without install:
+pip install git+https://github.com/Rana3112/snipai.git
+```
+
+All three do the same:
+- Installs Python 3.11 (via winget) if missing (PowerShell/npm path)
+- Installs Git if missing
 - Clones SnipAI into `%LOCALAPPDATA%\SnipAI`
-- Creates an isolated Python environment and installs all dependencies
-- Adds a `snipai` command usable from any CMD or PowerShell window
-- Creates Desktop and Start Menu shortcuts
-- Registers SnipAI to start automatically with Windows
+- Creates an isolated `.venv` and `pip install -r requirements.txt`
+- Adds `snipai`/`snippai` command to `PATH`
+- Creates Desktop and Start Menu shortcuts + autorun
 
 After install, the **Setup Wizard** opens automatically. Add a free [Groq API key](https://console.groq.com/keys) (no credit card required) and you're ready to go.
 

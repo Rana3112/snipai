@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snippai"
+version = "1.0.0"
+description = "SnipAI — AI Screen Assistant for Windows. Press hotkey, drag to select any screen region, get instant AI analysis. Free TinyFish search."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Rana3112", email = "dev@snipai.local" }]
+maintainers = [{ name = "Rana3112" }]
+keywords = ["ai", "screen-capture", "vision", "groq", "openrouter", "nvidia", "monid", "tinyfish"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+  "PySide6==6.8.1",
+  "keyboard==0.13.5",
+  "mss==10.0.0",
+  "pystray==0.19.5",
+  "Pillow==11.0.0",
+  "python-dotenv==1.0.1",
+  "openai==1.59.6",
+  "httpx==0.28.1",
+  "duckduckgo-search==6.3.7",
+  "requests==2.32.3",
+  "beautifulsoup4==4.12.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/Rana3112/snipai"
+Repository = "https://github.com/Rana3112/snipai.git"
+Issues = "https://github.com/Rana3112/snipai/issues"
+
+[project.scripts]
+snippai = "snipai.__main__:main"
+snipai = "snipai.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["snipai*"]
+
+[tool.setuptools.package-data]
+snipai = ["ui/lucide_icons/*.svg"]
+
+[project.optional-dependencies]
+dev = ["build", "twine", "pyinstaller"]
