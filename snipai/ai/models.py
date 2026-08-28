@@ -128,6 +128,94 @@ def pick_free_vision(provider_id: str | None = None,
     return None
 
 
+def get_active_provider_ids() -> list[str]:
+    """Return list of provider ids that have an API key configured (Active)."""
+    active: list[str] = []
+    # Preset providers (exclude 'custom' template)
+    from ..config import config as _cfg
+    # Check presets via provider_keys + legacy single key
+    preset_ids = ["openai", "anthropic", "google", "groq", "nvidia", "openrouter", "opencode_zen", "bluesminds"]
+    for pid in preset_ids:
+        key = _cfg.provider_key(pid)
+        if key:
+            active.append(pid)
+    # Custom providers: any with base_url (api_key may be empty for local Ollama)
+    for cp in _cfg.CUSTOM_PROVIDERS:
+        cid = f"custom:{cp.get('name','').strip()}"
+        if cid != "custom:" and _cfg.custom_provider_base_url(cid):
+            if cid not in active:
+                active.append(cid)
+    return active
+
+
+def collect_free_vision_across_active(
+    blocked_models: set[str] | None = None,
+    blocked_providers: set[str] | None = None,
+) -> list[tuple[str, dict]]:
+    """Collect free records from all Active providers (random across all 3).
+
+    Ensures cache is populated (best-effort fetch) for each active provider.
+    Returns list of (provider_id, record) for every **free** model not blocked,
+    vision preferred but not required — so Groq (text-only free) is included.
+    Falls back to vision-only then any if no free exists.
+    """
+    import random
+    blocked_models = blocked_models or set()
+    blocked_providers = blocked_providers or set()
+    active = get_active_provider_ids()
+    out: list[tuple[str, dict]] = []
+    # First pass: all free (vision or not) — includes Groq text free
+    for pid in active:
+        if pid in blocked_providers:
+            continue
+        if get_cached_records(pid) is None:
+            try:
+                fetch_models_sync(pid)
+            except Exception as e:
+                log.warning("collect free: fetch failed for %s: %s", pid, e)
+                continue
+        recs = get_cached_records(pid) or []
+        for r in recs:
+            if r.get("free") and r["id"] not in blocked_models:
+                out.append((pid, r))
+    if out:
+        return out
+    # Fallback: vision-only (if no free at all, e.g. single paid provider)
+    for pid in active:
+        if pid in blocked_providers:
+            continue
+        recs = get_cached_records(pid) or []
+        for r in recs:
+            if r.get("vision") and r["id"] not in blocked_models:
+                out.append((pid, r))
+    if out:
+        return out
+    # Last resort: any
+    for pid in active:
+        if pid in blocked_providers:
+            continue
+        recs = get_cached_records(pid) or []
+        for r in recs:
+            if r["id"] not in blocked_models:
+                out.append((pid, r))
+    return out
+
+
+def pick_random_free_vision_across_active(
+    blocked_models: set[str] | None = None,
+    blocked_providers: set[str] | None = None,
+) -> tuple[str, dict] | None:
+    """Pick a random free+vision model from the combined pool of all Active providers.
+
+    Returns (provider_id, record) or None if no active providers/models.
+    """
+    import random
+    pool = collect_free_vision_across_active(blocked_models, blocked_providers)
+    if not pool:
+        return None
+    return random.choice(pool)
+
+
 class ModelsFetcher(QThread):
     """Async wrapper around fetch_models_sync. Emits full records list."""
 

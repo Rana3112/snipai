@@ -5,6 +5,7 @@ Stateless: sends user's API key with every request. Never stores it server-side.
 from __future__ import annotations
 import json
 import logging
+import re
 from typing import Generator
 
 import httpx
@@ -83,12 +84,26 @@ class SnipAIBackend:
                         # Backend error envelope.
                         if isinstance(data, dict) and "error" in data:
                             err_str = str(data["error"])
+                            status = data.get("status")
                             if "rate" in err_str.lower() or "429" in err_str:
                                 raise RateLimitError(self.model, err_str)
-                            raise UpstreamError(self.model, err_str)
+                            raise UpstreamError(self.model, err_str, status)
                         delta = data.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content")
                         if content:
+                            # Detect provider errors streamed as plain content.
+                            # Groq rate-limit is streamed as: "Error: Rate limit reached for model openai/gpt-oss-120b ... Tokens per minute (TPM): Limit 8000..."
+                            # We must raise RateLimitError so the worker auto-rotates to next free model,
+                            # otherwise it would be shown as a normal assistant message.
+                            lower = content.lower()
+                            if "rate limit" in lower or "rate_limit" in lower or "tokens per minute" in lower or " 429" in content or "429" in content and "rate" in lower:
+                                raise RateLimitError(self.model, content)
+                            if content.startswith("Error: Error code:") or "model_not_found" in content:
+                                m = re.search(r"Error code: (\d{3})", content)
+                                raise UpstreamError(
+                                    self.model, content,
+                                    int(m.group(1)) if m else None,
+                                )
                             yield content
         except httpx.HTTPStatusError as e:
             raise UpstreamError(self.model, str(e), e.response.status_code) from e

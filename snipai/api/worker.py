@@ -7,8 +7,9 @@ import logging
 from PySide6.QtCore import QThread, Signal
 
 from .client import SnipAIBackend, RateLimitError, UpstreamError
-from ..ai.models import get_cached_records, pick_free_vision
+from ..ai.models import get_cached_records, pick_free_vision, pick_random_free_vision_across_active, get_active_provider_ids
 from ..config import config
+import random
 
 log = logging.getLogger(__name__)
 
@@ -20,7 +21,8 @@ SYSTEM_PROMPT = (
     "Format answers for a compact floating chat UI: use short sections, bullets, "
     "bold key takeaways, and tables when comparing items or summarizing structured data. "
     "For links, use descriptive link text and include the URL in parentheses when useful. "
-    "For follow-up questions, refer back to the original selection and prior turns."
+    "For follow-up questions, refer back to the original selection and prior turns. "
+    "Never include <think> tags, chain-of-thought, or internal reasoning — only the final answer."
 )
 
 PLANNER_SUFFIX = (
@@ -250,7 +252,7 @@ class GeminiWorker(QThread):
         last_err: str = ""
         tried_pairs: list[tuple[str, str]] = []
 
-        # Build the initial candidate list.
+        # Build the initial candidate list (ordered fallback).
         candidates = self._candidates_in_order(blocked_providers, blocked_models)
         if not candidates:
             self.failed.emit(
@@ -258,21 +260,45 @@ class GeminiWorker(QThread):
             )
             return
 
-        # If the explicitly chosen model is in the first candidate provider, try it first.
-        chosen = (self.provider_id, self.model)
-        if chosen in candidates:
-            candidates.remove(chosen)
-            candidates.insert(0, chosen)
-        else:
-            # Specified model on a different provider: still try it first.
-            api_key = config.provider_key(self.provider_id)
-            if self.provider_id.startswith("custom:"):
-                api_key = config.custom_provider_api_key(self.provider_id)
-            if api_key and (
-                not self.provider_id.startswith("custom:")
-                or config.custom_provider_base_url(self.provider_id)
-            ):
+        # Random free model across ALL active providers (when 2+ active)
+        # User wants: fetch free models from all 3 active (Groq/NVIDIA/OpenRouter) and pick random
+        chosen: tuple[str, str] | None = None
+        try:
+            active = get_active_provider_ids()
+            if len(active) >= 2:
+                rnd = pick_random_free_vision_across_active(blocked_models, blocked_providers)
+                if rnd:
+                    rnd_pid, rnd_rec = rnd
+                    rnd_pair = (rnd_pid, rnd_rec["id"])
+                    if rnd_pair not in candidates:
+                        candidates.insert(0, rnd_pair)
+                    else:
+                        candidates.remove(rnd_pair)
+                        candidates.insert(0, rnd_pair)
+                    log.info("random free pick across %d active: %s/%s", len(active), rnd_pid, rnd_rec["id"])
+                    chosen = rnd_pair
+                else:
+                    raise ValueError("no random free")
+            else:
+                raise ValueError("single active")
+        except Exception as e:
+            log.info("random free pick not used (%s), using ordered fallback", e)
+            chosen = None
+        if chosen is None:
+            # Original ordered logic: try explicitly chosen model first
+            chosen = (self.provider_id, self.model)
+            if chosen in candidates:
+                candidates.remove(chosen)
                 candidates.insert(0, chosen)
+            else:
+                api_key = config.provider_key(self.provider_id)
+                if self.provider_id.startswith("custom:"):
+                    api_key = config.custom_provider_api_key(self.provider_id)
+                if api_key and (
+                    not self.provider_id.startswith("custom:")
+                    or config.custom_provider_base_url(self.provider_id)
+                ):
+                    candidates.insert(0, chosen)
 
         for attempt in range(self.MAX_FALLBACKS + 1):
             if self.isInterruptionRequested():
@@ -318,6 +344,22 @@ class GeminiWorker(QThread):
                 last_err = str(e)
                 log.warning("provider=%s model=%s upstream error: %s",
                             current_provider, current_model, e)
+                # Mark quota/rate-limit and retired models as not-free so we don't retry them
+                lower_msg = e.message.lower() if hasattr(e, "message") else str(e).lower()
+                if (
+                    e.status_code in (402, 404, 429)
+                    or "not_found" in lower_msg
+                    or "does not exist" in lower_msg
+                    or "rate limit" in lower_msg
+                    or "tokens per minute" in lower_msg
+                    or "credits" in lower_msg
+                    or "quota" in lower_msg
+                ):
+                    recs = get_cached_records(current_provider) or []
+                    for r in recs:
+                        if r["id"] == current_model:
+                            r["free"] = False
+                            break
                 more = self._candidates_in_order(blocked_providers, blocked_models)
                 candidates = more + candidates
             except Exception as e:
@@ -370,17 +412,27 @@ class GeminiWorker(QThread):
         web_context = ""
         if query:
             self.tool_used.emit(f"Searching: {query[:60]}")
+            # FREE path: TinyFish via Monid locally ($0/1k, no quota) — primary
+            # Falls back to backend /v1/search (Jina) if local miss or monid not installed
             try:
-                import httpx
-                resp = httpx.post(
-                    f"{config.BACKEND_URL}/v1/search",
-                    json={"query": query},
-                    timeout=60,
-                )
-                if resp.status_code == 200:
-                    web_context = resp.json().get("context", "")
+                from ..ai.tools import deep_research as local_deep_research
+                web_context = local_deep_research(query)
+                if not web_context.strip():
+                    raise ValueError("empty local search result")
+                log.info("local TinyFish deep_research succeeded (%d chars, free)", len(web_context))
             except Exception as e:
-                log.warning("search failed, continuing without context: %s", e)
+                log.warning("local TinyFish search failed/miss, falling back to backend: %s", e)
+                try:
+                    import httpx
+                    resp = httpx.post(
+                        f"{config.BACKEND_URL}/v1/search",
+                        json={"query": query},
+                        timeout=60,
+                    )
+                    if resp.status_code == 200:
+                        web_context = resp.json().get("context", "")
+                except Exception as e2:
+                    log.warning("backend search also failed, continuing without context: %s", e2)
             if self.isInterruptionRequested():
                 return
 
@@ -398,7 +450,9 @@ class GeminiWorker(QThread):
                     "Now write the complete final answer. Combine what the selection "
                     "shows with the useful facts and links you found above. Include any "
                     "relevant URLs the user asked for. Do not mention that you searched — "
-                    "just give a clean, helpful answer in Markdown."
+                    "just give a clean, helpful answer in Markdown. "
+                    "Use proper Markdown tables with | and |---|---| for comparisons, bullet lists with - or *, "
+                    "and bold (**text**) for key takeaways. Never include <think> tags, chain-of-thought, or internal reasoning."
                 ),
             })
             self.tool_used.emit("Writing answer...")
@@ -407,7 +461,9 @@ class GeminiWorker(QThread):
                 "role": "user",
                 "content": (
                     "Write the complete final answer based on the analysis above. "
-                    "Use Markdown. Be concise and helpful."
+                    "Use Markdown. Be concise and helpful. "
+                    "Use proper Markdown tables (| + |---|---|) for comparisons, bullet lists, and bold for key points. "
+                    "Never include <think> tags, chain-of-thought, or internal reasoning."
                 ),
             })
 

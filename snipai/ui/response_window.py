@@ -6,6 +6,7 @@ Auto-send on open: cropped image + dynamic default prompt fired immediately.
 """
 from __future__ import annotations
 import logging
+import re
 import time
 from PySide6.QtCore import (
     Qt, QPoint, QRect, Signal, Slot, QSize, QTimer,
@@ -19,19 +20,22 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextBrowser, QPushButton,
     QApplication, QFrame, QGraphicsDropShadowEffect, QTextEdit,
     QComboBox, QScrollArea, QCheckBox, QMenu, QSizePolicy, QSizeGrip,
+    QStackedWidget,
 )
 
 from ..api.worker import (
     GeminiWorker, build_initial_messages, build_text_messages,
     build_stack_messages, SYSTEM_PROMPT,
 )
-from ..ai.models import get_cached_records, ModelsFetcher
+from ..ai.models import get_cached_records, ModelsFetcher, get_active_provider_ids, pick_random_free_vision_across_active, collect_free_vision_across_active
 from ..ai import modes as prompt_modes
 from ..ai.actions import extract_actions, Action
 from .. import store
 from ..config import config
 from .theme import generate_stylesheet, get_link_color
 from .markdown import markdown_to_html
+from .inline_settings import InlineSettingsWidget
+from .icons import lucide_icon, lucide_pixmap, set_button_lucide_icon
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +115,11 @@ class _MessageRow(QFrame):
         self.avatar.setFixedSize(32, 32)
         self.avatar.setObjectName("row_avatar_user" if role == "user" else "row_avatar_ai")
         self.avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.avatar.setText("AD" if role == "user" else "✦")
+        _av_pix = lucide_pixmap("user" if role == "user" else "sparkles", 16, "#ffffff")
+        if _av_pix is not None and not _av_pix.isNull():
+            self.avatar.setPixmap(_av_pix)
+        else:
+            self.avatar.setText("AD" if role == "user" else "✦")
         col = QVBoxLayout()
         col.setContentsMargins(0, 0, 0, 0)
         col.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignTop)
@@ -163,28 +171,135 @@ class _MessageRow(QFrame):
     def _build_actions(self) -> QWidget:
         bar = QWidget(objectName="msg_actions")
         h = QHBoxLayout(bar)
-        h.setContentsMargins(0, 2, 0, 0)
-        h.setSpacing(2)
-        for glyph, tip in (("⧉", "Copy"), ("👍", "Good"), ("👎", "Bad"), ("🔊", "Speak"), ("⋯", "More")):
-            b = QPushButton(glyph, objectName="msg_action_btn")
+        h.setContentsMargins(0, 4, 0, 0)
+        h.setSpacing(4)
+        for name, tip in (("copy", "Copy"), ("thumbs-up", "Good"), ("thumbs-down", "Bad"), ("volume-2", "Speak"), ("ellipsis", "More")):
+            b = QPushButton(objectName="msg_action_btn")
+            set_button_lucide_icon(b, name, 15, "#9a9a9a")
+            if b.icon().isNull():
+                fallback = {"copy": "⧉", "thumbs-up": "👍", "thumbs-down": "👎", "volume-2": "🔊", "ellipsis": "⋯"}[name]
+                b.setText(fallback)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setToolTip(tip)
-            b.setFixedHeight(26)
+            b.setMinimumHeight(28)
+            b.setMinimumWidth(32)
+            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             h.addWidget(b, 0)
             if tip == "Copy":
                 b.clicked.connect(self._copy_self)
+            elif tip == "Good":
+                b.clicked.connect(lambda _=False, btn=b: self._on_feedback(btn, True))
+            elif tip == "Bad":
+                b.clicked.connect(lambda _=False, btn=b: self._on_feedback(btn, False))
+            elif tip == "Speak":
+                b.clicked.connect(self._speak_self)
+            elif tip == "More":
+                b.clicked.connect(self._show_more_menu)
         h.addStretch(1)
         export = QPushButton("Export  ▾", objectName="export_btn")
+        set_button_lucide_icon(export, "download", 12, "#ececec")
         export.setCursor(Qt.CursorShape.PointingHandCursor)
         menu = QMenu(export)
         for label in ("Copy as Markdown", "Copy as Text", "Save to file"):
-            menu.addAction(label)
+            act = menu.addAction(label)
+            act.triggered.connect(lambda _=False, lbl=label: self._on_export(lbl))
         export.setMenu(menu)
         h.addWidget(export, 0)
         return bar
 
     def _copy_self(self) -> None:
         QApplication.clipboard().setText(self._raw_md)
+        # Visual feedback — briefly highlight
+        try:
+            from PySide6.QtCore import QTimer
+            # Find the copy button and flash it
+            for child in self.findChildren(QPushButton):
+                if child.toolTip() == "Copy":
+                    orig = child.styleSheet()
+                    child.setStyleSheet(orig + " background: rgba(91,106,255,0.25); color: #ffffff;")
+                    QTimer.singleShot(600, lambda c=child, s=orig: c.setStyleSheet(s))
+                    break
+        except Exception:
+            pass
+
+    def _on_feedback(self, btn: QPushButton, is_good: bool) -> None:
+        # Toggle visual state and show toast via parent window status
+        try:
+            # Reset siblings
+            for sibling in self.findChildren(QPushButton):
+                if sibling.toolTip() in ("Good", "Bad"):
+                    sibling.setStyleSheet("")
+            # Highlight selected
+            btn.setStyleSheet("background: rgba(91,106,255,0.20); color: #ffffff; border: 1px solid rgba(91,106,255,0.35);")
+            # Find parent ResponseWindow and show status
+            parent = self
+            while parent and not hasattr(parent, "_status_label"):
+                parent = parent.parent()
+            if parent and hasattr(parent, "_status_label"):
+                parent._status_bar.show()
+                parent._status_label.setText("Thanks for your feedback!" if is_good else "Thanks — we'll improve.")
+                parent._status_label.setStyleSheet("color: #4ade80;" if is_good else "color: #fbbf24;")
+        except Exception:
+            pass
+
+    def _speak_self(self) -> None:
+        # Text-to-speech via QTextToSpeech if available
+        try:
+            from PySide6.QtTextToSpeech import QTextToSpeech
+            engine = QTextToSpeech()
+            # Strip markdown for speaking
+            text = re.sub(r"[*_`#\[\]\(\)]", "", self._raw_md)[:4000]
+            engine.say(text)
+        except Exception:
+            try:
+                # Fallback: copy to clipboard and notify
+                QApplication.clipboard().setText(self._raw_md)
+                parent = self
+                while parent and not hasattr(parent, "_status_label"):
+                    parent = parent.parent()
+                if parent:
+                    parent._status_bar.show()
+                    parent._status_label.setText("Copied for speech — TTS not available")
+            except Exception:
+                pass
+
+    def _show_more_menu(self) -> None:
+        # Show export menu as fallback for More
+        try:
+            for child in self.findChildren(QPushButton):
+                if child.toolTip() == "More":
+                    # Find export button in same bar and show its menu
+                    bar = child.parent()
+                    if bar:
+                        for btn in bar.findChildren(QPushButton):
+                            if btn.objectName() == "export_btn" and btn.menu():
+                                btn.menu().popup(QCursor.pos())
+                                return
+                    break
+            # Fallback: simple menu
+            m = QMenu(self)
+            for label in ("Copy as Markdown", "Report issue"):
+                m.addAction(label)
+            m.exec(QCursor.pos())
+        except Exception:
+            pass
+
+    def _on_export(self, label: str) -> None:
+        try:
+            if label == "Copy as Markdown":
+                QApplication.clipboard().setText(self._raw_md)
+            elif label == "Copy as Text":
+                import re as _re
+                txt = _re.sub(r"[*_`#\[\]]", "", self._raw_md)
+                QApplication.clipboard().setText(txt)
+            elif label == "Save to file":
+                from PySide6.QtWidgets import QFileDialog
+                path, _ = QFileDialog.getSaveFileName(self, "Save", "snipai.md", "Markdown (*.md);;Text (*.txt)")
+                if path:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(self._raw_md)
+        except Exception:
+            pass
 
     def set_markdown(self, md: str) -> None:
         self._raw_md = md
@@ -207,6 +322,8 @@ class ResponseWindow(QWidget):
     closed = Signal()
 
     DEFAULT_SIZE = QSize(1020, 850)
+    COMPACT_SIZE = QSize(480, 620)
+    EXPANDED_SIZE = QSize(1020, 850)
     THUMB_MAX = 64
 
     def __init__(self, anchor: QRect, png: bytes | None = None,
@@ -245,8 +362,14 @@ class ResponseWindow(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.setMinimumSize(QSize(420, 380))
-        self.resize(self.DEFAULT_SIZE)
+        self.setMinimumSize(QSize(380, 420))
+        # Compact by default: small chat widget; expand button reveals full layout
+        self._is_expanded: bool = False
+        self._anchor_rect: QRect = QRect(anchor)
+        self._compact_size: QSize = QSize(self.COMPACT_SIZE)
+        self._expanded_size: QSize = QSize(self.EXPANDED_SIZE)
+        self._geom_anim: QPropertyAnimation | None = None
+        self.resize(self._compact_size)
         self.setMouseTracking(True)
 
         # Edge-drag resize state
@@ -256,7 +379,11 @@ class ResponseWindow(QWidget):
         self._RESIZE_MARGIN = 8
 
         self._build_ui(png)
-        self._position_near(anchor)
+        # Compact: sidebar hidden, ChatGPT-like centered feed
+        if hasattr(self, "_sidebar"):
+            self._sidebar.setVisible(False)
+        self._apply_compact_header(False)
+        self._position_compact_near_anchor()
         self._populate_models()
         QTimer.singleShot(0, self._auto_send)
 
@@ -293,19 +420,27 @@ class ResponseWindow(QWidget):
         s.setContentsMargins(14, 16, 14, 14)
         s.setSpacing(12)
 
-        # Brand row
+        # Brand row — Lucide sparkles
         brand = QHBoxLayout()
         brand.setSpacing(10)
-        logo = QLabel("✦", objectName="brand_logo")
+        logo = QLabel(objectName="brand_logo")
         logo.setFixedSize(34, 34)
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _pix = lucide_pixmap("sparkles", 18, "#ffffff")
+        if _pix is not None and not _pix.isNull():
+            logo.setPixmap(_pix)
+        else:
+            logo.setText("✦")
         brand.addWidget(logo, 0)
         brand.addWidget(QLabel("Snip AI", objectName="brand_title"), 0)
         brand.addStretch(1)
-        compose = QPushButton("✎", objectName="compose_btn")
+        compose = QPushButton(objectName="compose_btn")
         compose.setFixedSize(32, 32)
         compose.setCursor(Qt.CursorShape.PointingHandCursor)
         compose.setToolTip("New chat")
+        set_button_lucide_icon(compose, "square-pen", 16, "#ececec")
+        if compose.icon().isNull():
+            compose.setText("✎")
         compose.clicked.connect(self._new_chat)
         brand.addWidget(compose, 0)
         s.addLayout(brand)
@@ -334,20 +469,26 @@ class ResponseWindow(QWidget):
         hist_scroll.setWidget(self._hist_container)
         s.addWidget(hist_scroll, 1)
 
-        # Footer buttons
+        # Footer buttons — Lucide: moon/shield/settings (all responsive)
         footer = QHBoxLayout()
-        footer.setSpacing(4)
-        for glyph, tip, slot in (
-            ("☾", "Light / Dark mode", None),
-            ("⛉", "Documentation", None),
-            ("⚙", "Settings", self._open_settings),
+        footer.setSpacing(6)
+        for name, tip, slot in (
+            ("moon", "Light / Dark mode", self._toggle_theme_mode),
+            ("shield", "Documentation", self._open_docs),
+            ("settings", "Settings", self._show_inline_settings),
         ):
-            b = QPushButton(glyph, objectName="footer_btn")
+            b = QPushButton(objectName="footer_btn")
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setToolTip(tip)
-            b.setFixedSize(36, 32)
+            b.setMinimumSize(36, 32)
+            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            set_button_lucide_icon(b, name, 16, "#9a9a9a")
+            if b.icon().isNull():
+                fallback = {"moon": "☾", "shield": "⛉", "settings": "⚙"}[name]
+                b.setText(fallback)
             if slot:
                 b.clicked.connect(slot)
+            # Hover feedback via stylesheet already, plus size policy makes it responsive
             footer.addWidget(b, 0)
         footer.addStretch(1)
         s.addLayout(footer)
@@ -359,6 +500,14 @@ class ResponseWindow(QWidget):
         v = QVBoxLayout(area)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
+
+        self._chat_stack = QStackedWidget()
+        v.addWidget(self._chat_stack, 1)
+
+        chat_page = QWidget(objectName="chat_page")
+        pv = QVBoxLayout(chat_page)
+        pv.setContentsMargins(0, 0, 0, 0)
+        pv.setSpacing(0)
 
         # ── Header (dropdown bar) ──────────────────────────
         self.header = QWidget(objectName="header")
@@ -376,6 +525,13 @@ class ResponseWindow(QWidget):
         else:
             self._set_thumb(png)
         h.addWidget(self.thumb, 0)
+
+        self.header_title = QLabel("Snip AI", objectName="header_title")
+        self.header_title.setStyleSheet(
+            "color:#ffffff; font-size:11pt; font-weight:700; "
+            "font-family:'Inter','Segoe UI',sans-serif; letter-spacing:-0.2px;"
+        )
+        h.addWidget(self.header_title, 0)
 
         self.mode_select = QComboBox()
         self.mode_select.setObjectName("mode_select")
@@ -419,12 +575,35 @@ class ResponseWindow(QWidget):
         self.free_only_check.toggled.connect(self._on_free_only_toggled)
         h.addWidget(self.free_only_check, 0)
 
-        self.btn_close = QPushButton("✕", objectName="close_btn")
+        self.btn_switch = QPushButton(objectName="switch_btn")
+        self.btn_switch.setFixedSize(32, 32)
+        self.btn_switch.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_switch.setToolTip("Switch to another free model — picks random free across all Active providers (Groq/NVIDIA/OpenRouter)")
+        set_button_lucide_icon(self.btn_switch, "refresh-cw", 16, "#9a9a9a")
+        if self.btn_switch.icon().isNull():
+            self.btn_switch.setText("🔄")
+        self.btn_switch.clicked.connect(self._switch_to_random_free_model)
+        h.addWidget(self.btn_switch, 0)
+
+        self.btn_expand = QPushButton(objectName="expand_btn")
+        self.btn_expand.setFixedSize(32, 32)
+        self.btn_expand.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_expand.setToolTip("Expand to full view")
+        set_button_lucide_icon(self.btn_expand, "maximize-2", 16, "#9a9a9a")
+        if self.btn_expand.icon().isNull():
+            self.btn_expand.setText("⛶")
+        self.btn_expand.clicked.connect(self._toggle_expand)
+        h.addWidget(self.btn_expand, 0)
+
+        self.btn_close = QPushButton(objectName="close_btn")
         self.btn_close.setFixedSize(32, 32)
         self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        set_button_lucide_icon(self.btn_close, "x", 16, "#9a9a9a")
+        if self.btn_close.icon().isNull():
+            self.btn_close.setText("✕")
         self.btn_close.clicked.connect(self.close)
         h.addWidget(self.btn_close, 0)
-        v.addWidget(self.header)
+        pv.addWidget(self.header)
 
         # ── Feed (scrollable message rows) ─────────────────
         self.feed_scroll = QScrollArea(objectName="feed_scroll")
@@ -436,7 +615,7 @@ class ResponseWindow(QWidget):
         self.feed_layout.setSpacing(0)
         self.feed_layout.addStretch(1)
         self.feed_scroll.setWidget(self.feed)
-        v.addWidget(self.feed_scroll, 1)
+        pv.addWidget(self.feed_scroll, 1)
 
         # ── Thinking indicator ─────────────────────────────
         self._thinking_bar = QWidget()
@@ -446,10 +625,10 @@ class ResponseWindow(QWidget):
         self._dots = _ThinkingDots()
         tb_layout.addWidget(self._dots)
         self._thinking_label = QLabel("Analyzing...")
-        self._thinking_label.setStyleSheet("color: #8b9aff; font-size: 9pt; font-weight: 600;")
+        self._thinking_label.setStyleSheet("color: #ececec; font-size: 9pt; font-weight: 600; font-family:'Inter','Segoe UI',sans-serif;")
         tb_layout.addWidget(self._thinking_label)
         tb_layout.addStretch(1)
-        v.addWidget(self._thinking_bar)
+        pv.addWidget(self._thinking_bar)
         self._thinking_bar.hide()
 
         # ── Status bar ──────────────────────────────────────
@@ -459,8 +638,68 @@ class ResponseWindow(QWidget):
         self._status_label = QLabel("", objectName="status")
         sb_layout.addWidget(self._status_label)
         sb_layout.addStretch(1)
-        v.addWidget(self._status_bar)
+        pv.addWidget(self._status_bar)
         self._status_bar.hide()
+
+        # ── Text-mode option cards (shown before first processing) ──
+        self._text_options_bar = QWidget(objectName="text_options_bar")
+        ob_lay = QHBoxLayout(self._text_options_bar)
+        ob_lay.setContentsMargins(20, 8, 20, 8)
+        ob_lay.setSpacing(10)
+        self._text_option_buttons: list[QPushButton] = []
+        options = [
+            ("book-open", "Explain the word meaning", "explain_word"),
+            ("file-text", "Explain the text in depth", "explain_in_depth"),
+            ("search", "Search", "search"),
+        ]
+        for icon_name, label, key in options:
+            btn = QPushButton(f"  {label}", objectName="text_option_card")
+            set_button_lucide_icon(btn, icon_name, 16, "#ececec")
+            if btn.icon().isNull():
+                fallback = {"book-open": "📖", "file-text": "📄", "search": "🌐"}[icon_name]
+                btn.setText(f"{fallback}  {label}")
+            else:
+                btn.setText(f"  {label}")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setMinimumHeight(42)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.setToolTip(label)
+            btn.clicked.connect(lambda _=False, k=key: self._on_text_option_selected(k))
+            # Card styling — ChatGPT-like pill, matches input_container
+            btn.setStyleSheet(
+                "QPushButton#text_option_card {"
+                " background: #2f2f2f; color: #ececec; border: 1px solid #3a3a3a;"
+                " border-radius: 12px; padding: 10px 12px; font-size: 9pt; font-weight: 600;"
+                " font-family: 'Inter','Segoe UI',sans-serif; text-align: left;"
+                "}"
+                "QPushButton#text_option_card:hover { background: #3a3a3a; border-color: #4a4a4a; }"
+                "QPushButton#text_option_card:pressed { background: #404040; }"
+            )
+            ob_lay.addWidget(btn, 1)
+            self._text_option_buttons.append(btn)
+        pv.addWidget(self._text_options_bar)
+        self._text_options_bar.hide()
+
+        # ── Rate limit bar (shown on 429) ─────────────────
+        self._rate_limit_bar = QWidget(objectName="rate_limit_bar")
+        rl_lay = QHBoxLayout(self._rate_limit_bar)
+        rl_lay.setContentsMargins(14, 10, 14, 10)
+        rl_lay.setSpacing(10)
+        self._rate_limit_label = QLabel("Rate limit reached — try another free model", objectName="rate_limit_label")
+        self._rate_limit_label.setWordWrap(True)
+        rl_lay.addWidget(self._rate_limit_label, 1)
+        self._rate_limit_btn = QPushButton(" Switch model", objectName="rate_limit_btn")
+        set_button_lucide_icon(self._rate_limit_btn, "refresh-cw", 14, "#ffffff")
+        if self._rate_limit_btn.icon().isNull():
+            self._rate_limit_btn.setText("🔄 Switch model")
+        else:
+            self._rate_limit_btn.setText(" Switch model")
+        self._rate_limit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rate_limit_btn.setToolTip("Pick a random free model from all Active providers and retry")
+        self._rate_limit_btn.clicked.connect(self._on_rate_limit_retry)
+        rl_lay.addWidget(self._rate_limit_btn, 0)
+        pv.addWidget(self._rate_limit_bar)
+        self._rate_limit_bar.hide()
 
         # ── Input container ────────────────────────────────
         input_wrap = QWidget()
@@ -481,13 +720,19 @@ class ResponseWindow(QWidget):
         bar = QHBoxLayout()
         bar.setSpacing(4)
 
-        btn_web = QPushButton("🌐", objectName="input_tool")
+        btn_web = QPushButton(objectName="input_tool")
         btn_web.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_web.setToolTip("Web search")
         btn_web.setFixedSize(32, 32)
+        set_button_lucide_icon(btn_web, "globe", 16, "#9a9a9a")
+        if btn_web.icon().isNull():
+            btn_web.setText("🌐")
         bar.addWidget(btn_web, 0)
 
-        btn_attach = QPushButton("📎", objectName="input_tool")
+        btn_attach = QPushButton(objectName="input_tool")
+        set_button_lucide_icon(btn_attach, "paperclip", 16, "#9a9a9a")
+        if btn_attach.icon().isNull():
+            btn_attach.setText("📎")
         btn_attach.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_attach.setToolTip("Attach image")
         btn_attach.setFixedSize(32, 32)
@@ -495,9 +740,12 @@ class ResponseWindow(QWidget):
         bar.addWidget(btn_attach, 0)
 
         bar.addStretch(1)
-        self.btn_send = QPushButton("➤", objectName="send_btn")
+        self.btn_send = QPushButton(objectName="send_btn")
         self.btn_send.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_send.setFixedSize(34, 34)
+        set_button_lucide_icon(self.btn_send, "send", 16, "#000000")
+        if self.btn_send.icon().isNull():
+            self.btn_send.setText("➤")
         self.btn_send.clicked.connect(self._on_send)
         bar.addWidget(self.btn_send, 0)
         cv.addLayout(bar)
@@ -509,7 +757,15 @@ class ResponseWindow(QWidget):
         )
         disclaimer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         iw.addWidget(disclaimer)
-        v.addWidget(input_wrap)
+        pv.addWidget(input_wrap)
+
+        self._chat_stack.addWidget(chat_page)
+        # — Inline settings page (embedded, no separate window) —
+        self._inline_settings = InlineSettingsWidget()
+        self._inline_settings.closed.connect(self._hide_inline_settings)
+        self._inline_settings.saved.connect(self._on_inline_settings_saved)
+        self._chat_stack.addWidget(self._inline_settings)
+        self._chat_stack.setCurrentIndex(0)
         return area
 
     # ── Sidebar history ─────────────────────────────────────
@@ -571,6 +827,9 @@ class ResponseWindow(QWidget):
         self._current_buf = ""
         self._thinking_bar.hide()
         self._status_bar.hide()
+        self._hide_text_options()
+        if hasattr(self, "_rate_limit_bar"):
+            self._rate_limit_bar.hide()
         self.chat_input.setEnabled(True)
         self.btn_send.setEnabled(True)
 
@@ -600,9 +859,224 @@ class ResponseWindow(QWidget):
         self.chat_input.setFocus()
 
     def _open_settings(self) -> None:
-        from .settings_panel import SettingsPanel
-        dlg = SettingsPanel(self)
-        dlg.exec()
+        self._show_inline_settings()
+
+    def _show_inline_settings(self) -> None:
+        # Ensure expanded so settings has room; compact widget is too narrow
+        if not getattr(self, "_is_expanded", False):
+            self._toggle_expand()
+            # Give animation a moment, then show settings
+            QTimer.singleShot(280, self._do_show_inline_settings)
+        else:
+            self._do_show_inline_settings()
+
+    def _do_show_inline_settings(self) -> None:
+        try:
+            self._inline_settings.refresh()
+        except Exception:
+            pass
+        self._chat_stack.setCurrentWidget(self._inline_settings)
+
+    def _hide_inline_settings(self) -> None:
+        self._chat_stack.setCurrentIndex(0)
+        self.chat_input.setFocus()
+
+    def _on_inline_settings_saved(self) -> None:
+        # Re-apply theme after save (accent may have changed)
+        try:
+            from ..config import load_config
+            cfg = load_config()
+            self.setStyleSheet(generate_stylesheet(cfg.theme))
+            self._inline_settings._apply_theme()
+            # Update link color for browsers if needed
+        except Exception:
+            pass
+        self._chat_stack.setCurrentIndex(0)
+        self._status_bar.show()
+        self._status_label.setText("Settings saved — hotkeys need restart")
+        self._status_label.setStyleSheet("")
+        self.chat_input.setFocus()
+
+    def _toggle_theme_mode(self) -> None:
+        """Footer moon — toggle Dark/Light (Midnight ↔ Light preset)."""
+        try:
+            from .setup_wizard import THEME_PRESETS
+            from ..config import ThemeConfig, save_config, load_config
+            cfg = load_config()
+            is_light = cfg.theme.bg_primary.lower() == "#ffffff"
+            new_preset = THEME_PRESETS["Midnight"] if is_light else THEME_PRESETS["Light"]
+            new_theme = ThemeConfig(**new_preset)
+            cfg.theme = new_theme
+            save_config(cfg)
+            self.setStyleSheet(generate_stylesheet(new_theme))
+            if hasattr(self, "_inline_settings"):
+                try:
+                    self._inline_settings._cfg.theme = new_theme
+                    self._inline_settings._apply_theme()
+                except Exception:
+                    pass
+            # Update footer moon icon to sun when dark, moon when light for next toggle
+            # Find the moon button and swap its icon
+            for child in self.findChildren(QPushButton):
+                if child.toolTip() == "Light / Dark mode":
+                    new_icon = "sun" if not is_light else "moon"
+                    # is_light was true → was light, now switching to Midnight (dark) → show moon next? Actually toggle, so after switch to dark, next should be sun
+                    icon_name = "sun" if not is_light else "moon"
+                    # We are now in dark if we just switched from light, so show sun for next
+                    set_button_lucide_icon(child, icon_name, 16, "#9a9a9a")
+                    break
+            self._status_bar.show()
+            self._status_label.setText("Theme: Dark" if not is_light else "Theme: Light")
+            self._status_label.setStyleSheet("color: #4ade80;")
+        except Exception as e:
+            log.warning("Theme toggle failed: %s", e)
+
+    def _open_docs(self) -> None:
+        try:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl("https://github.com/Rana3112/snipai"))
+            self._status_bar.show()
+            self._status_label.setText("Opening docs — github.com/Rana3112/snipai")
+        except Exception:
+            pass
+
+    def _switch_to_random_free_model(self) -> None:
+        """Header 🔄 — pick random free across all Active and switch."""
+        if hasattr(self, "_rate_limit_bar"):
+            self._rate_limit_bar.hide()
+        rnd = pick_random_free_vision_across_active(blocked_models={self._current_model})
+        if not rnd:
+            rnd = pick_random_free_vision_across_active()
+        if not rnd:
+            self._status_bar.show()
+            self._status_label.setText("No other free models available — add API keys in Settings")
+            self._status_label.setStyleSheet("color: #fca5a5;")
+            return
+        pid, rec = rnd
+        new_model = rec["id"]
+        found = False
+        for i, m in enumerate(self._model_records):
+            if m["id"] == new_model:
+                self.model_select.blockSignals(True)
+                self.model_select.setCurrentIndex(i)
+                self.model_select.blockSignals(False)
+                found = True
+                break
+        if not found:
+            self.model_select.blockSignals(True)
+            self.model_select.addItem(f"{rec.get('name') or new_model}  ·  ★ Free")
+            self.model_select.setCurrentIndex(self.model_select.count() - 1)
+            self.model_select.blockSignals(False)
+            self._model_records.append(rec)
+        self._current_model = new_model
+        self.model_select.setToolTip(f"Model: {new_model} (switched)")
+        self.provider_badge.setText(pid.replace("custom:", "Custom · "))
+        self.provider_badge.setVisible(True)
+        self._status_bar.show()
+        self._status_label.setText(f"Switched to {pid}/{new_model} — free")
+        self._status_label.setStyleSheet("color: #4ade80;")
+        log.info("manual switch to %s/%s", pid, new_model)
+
+    def _on_rate_limit_retry(self) -> None:
+        """Rate-limit bar button — switch and retry last request."""
+        if hasattr(self, "_rate_limit_bar"):
+            self._rate_limit_bar.hide()
+        if self._worker is not None:
+            return
+        rnd = pick_random_free_vision_across_active(blocked_models={self._current_model})
+        if not rnd:
+            rnd = pick_random_free_vision_across_active()
+        if not rnd:
+            self._status_label.setText("No alternative free models — add more API keys in Settings")
+            self._status_bar.show()
+            return
+        pid, rec = rnd
+        new_model = rec["id"]
+        found = False
+        for i, m in enumerate(self._model_records):
+            if m["id"] == new_model:
+                self.model_select.blockSignals(True)
+                self.model_select.setCurrentIndex(i)
+                self.model_select.blockSignals(False)
+                found = True
+                break
+        if not found:
+            self.model_select.blockSignals(True)
+            self.model_select.addItem(f"{rec.get('name') or new_model}  ·  ★ Free")
+            self.model_select.setCurrentIndex(self.model_select.count() - 1)
+            self.model_select.blockSignals(False)
+            self._model_records.append(rec)
+        self._current_model = new_model
+        self.provider_badge.setText(pid.replace("custom:", "Custom · "))
+        self.provider_badge.setVisible(True)
+        # Remove the error row if last assistant row is the rate-limit error
+        if self._rows and self._rows[-1].role == "assistant":
+            last_text = getattr(self._rows[-1], "_raw_md", "")
+            if "rate limit" in last_text.lower() or "Rate limit" in last_text:
+                row = self._rows.pop()
+                self.feed_layout.removeWidget(row)
+                row.deleteLater()
+                if self._messages and self._messages[-1].get("role") == "assistant":
+                    self._messages.pop()
+                self._active_row = None
+                self._current_buf = ""
+        if not self._messages:
+            self._status_label.setText("No previous request to retry")
+            self._status_bar.show()
+            return
+        self._first_turn_sent = True
+        self.chat_input.setEnabled(False)
+        self.btn_send.setEnabled(False)
+        self._clear_actions()
+        self._current_buf = ""
+        self._active_row = self._add_row("assistant", "_..._")
+        self._thinking_bar.show()
+        self._thinking_label.setText(f"Retrying with {pid}/{new_model}...")
+        self._status_bar.hide()
+        self._start_worker()
+
+    # ── Text-mode option cards ───────────────────────────────────────
+    def _show_text_options(self) -> None:
+        if hasattr(self, "_text_options_bar"):
+            self._text_options_bar.show()
+
+    def _hide_text_options(self) -> None:
+        if hasattr(self, "_text_options_bar"):
+            self._text_options_bar.hide()
+
+    def _on_text_option_selected(self, key: str) -> None:
+        """Handle click on one of the three text-mode cards."""
+        if self._worker is not None:
+            return
+        self._hide_text_options()
+        prompts = {
+            "explain_word": "Explain the meaning of the selected text. Define the word or phrase, its part of speech, etymology if relevant, usage, and provide 2-3 clear examples. Be concise and use Markdown. Use bullet lists and bold for key points. Never include <think> tags.",
+            "explain_in_depth": "Explain the selected text in depth. Provide a comprehensive analysis: break down its meaning, context, significance, key points, and any nuances or implications. Use Markdown with clear sections, bullet lists (- or *), tables (| + |---|---|) for comparisons, and bold (**text**) for key takeaways. Never include <think> tags or internal reasoning.",
+            "search": "Search the web for information about the selected text. Find relevant, up-to-date information including definitions, context, related links, and any recent news or references. Provide a concise summary with URLs in Markdown. Use tables for comparisons and bullets for lists. Never include <think> tags.",
+        }
+        prompt = prompts.get(key, "Analyze this selection. Be concise and use Markdown.")
+        extra = self.chat_input.toPlainText().strip()
+        if extra:
+            prompt = f"{prompt}\n\nAdditional user instruction: {extra}"
+            self.chat_input.clear()
+        try:
+            self._first_turn_sent = True
+            self.chat_input.setEnabled(False)
+            self.btn_send.setEnabled(False)
+            self._clear_actions()
+            system = self._system_for_mode()
+            self._messages = build_text_messages(prompt, self._selected_text, system=system)
+            self._current_buf = ""
+            self._active_row = self._add_row("assistant", "_..._")
+            self._thinking_bar.show()
+            self._thinking_label.setText("Searching..." if key == "search" else "Thinking...")
+            self._status_bar.hide()
+            self._start_worker()
+        except Exception:
+            log.exception("text option handling failed")
+            self.chat_input.setEnabled(True)
+            self.btn_send.setEnabled(True)
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -617,21 +1091,48 @@ class ResponseWindow(QWidget):
     def _scale_content(self) -> None:
         """Scale sidebar width + base font with the window so content shrinks/grows."""
         w = self.width()
-        # Sidebar: 200px at min width, 300px at large; hidden under 540px.
         sb = getattr(self, "_sidebar", None)
-        if sb is not None:
-            if w < 540:
+        # In compact widget mode we keep sidebar hidden; only expanded may show it
+        if getattr(self, "_is_expanded", False):
+            if sb is not None:
+                if w < 700:
+                    # Keep visible but narrower for mid sizes; hide only if very narrow
+                    if w < 540:
+                        sb.setVisible(False)
+                    else:
+                        sb.setVisible(True)
+                        sb_w = max(200, min(300, int(w * 0.26)))
+                        sb.setFixedWidth(sb_w)
+                else:
+                    sb.setVisible(True)
+                    sb_w = max(240, min(300, int(w * 0.26)))
+                    sb.setFixedWidth(sb_w)
+        else:
+            if sb is not None:
                 sb.setVisible(False)
-            else:
-                sb.setVisible(True)
-                sb_w = max(200, min(300, int(w * 0.26)))
-                sb.setFixedWidth(sb_w)
         # Base font scales 9pt (narrow) → 11pt (wide) across 640..1100px.
-        f = max(9.0, min(11.0, 9.0 + (w - 640) / 230.0))
+        base = 9.0 if not getattr(self, "_is_expanded", False) else 9.5
+        f = max(base, min(11.0, base + (w - 640) / 230.0))
         font = self.font()
         if abs(font.pointSizeF() - f) > 0.1:
             font.setPointSizeF(f)
             self.setFont(font)
+
+    def _apply_compact_header(self, expanded: bool) -> None:
+        """Show full header controls only when expanded; compact keeps it minimal."""
+        for attr in ("mode_select", "model_select", "free_only_check", "provider_badge"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                if attr == "provider_badge":
+                    has_text = bool(getattr(w, "text", lambda: "")())
+                    w.setVisible(expanded and has_text)
+                else:
+                    w.setVisible(expanded)
+        if hasattr(self, "header_title"):
+            self.header_title.setVisible(not expanded)
+        if hasattr(self, "thumb"):
+            self.thumb.setVisible(True)
+            self.thumb.setFixedSize(36, 36) if not expanded else self.thumb.setFixedSize(40, 40)
 
     def _set_thumb(self, png: bytes) -> None:
         dpr = float(QGuiApplication.primaryScreen().devicePixelRatio()) or 1.0
@@ -674,6 +1175,96 @@ class ResponseWindow(QWidget):
         if y < sg.top():
             y = sg.top() + 14
         self.move(x, y)
+
+    def _position_compact_near_anchor(self) -> None:
+        """Place the compact widget near the selection without covering it."""
+        geo = self._compute_compact_geo()
+        self.setGeometry(geo)
+
+    def _compute_compact_geo(self) -> QRect:
+        """Compute where compact widget should sit without moving yet."""
+        anchor = getattr(self, "_anchor_rect", None)
+        size = self._compact_size
+        if anchor is None or anchor.isEmpty():
+            screen = QGuiApplication.primaryScreen()
+            sg = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+            x = sg.right() - size.width() - 24
+            y = sg.bottom() - size.height() - 24
+            return QRect(max(sg.left(), x), max(sg.top(), y), size.width(), size.height())
+        screen = QGuiApplication.screenAt(anchor.center())
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        sg = screen.availableGeometry()
+        x = anchor.right() + 14
+        y = anchor.y()
+        if x + size.width() > sg.right():
+            x = anchor.x() - size.width() - 14
+        if x < sg.left():
+            x = sg.left() + 14
+        if y + size.height() > sg.bottom():
+            y = sg.bottom() - size.height() - 14
+        if y < sg.top():
+            y = sg.top() + 14
+        return QRect(x, y, size.width(), size.height())
+
+    def _position_expanded_centered(self) -> QRect:
+        screen = QGuiApplication.screenAt(self._anchor_rect.center()) if hasattr(self, "_anchor_rect") else None
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        sg = screen.availableGeometry()
+        target = self._expanded_size
+        w = min(target.width(), sg.width() - 32)
+        h = min(target.height(), sg.height() - 32)
+        x = sg.center().x() - w // 2
+        y = sg.center().y() - h // 2
+        return QRect(x, y, w, h)
+
+    def _animate_to_geometry(self, target: QRect) -> None:
+        try:
+            anim = QPropertyAnimation(self, b"geometry", self)
+            anim.setDuration(260)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setStartValue(self.geometry())
+            anim.setEndValue(target)
+            anim.start()
+            # Keep reference so GC doesn't stop it
+            self._geom_anim = anim
+            anim.finished.connect(lambda: setattr(self, "_geom_anim", None))
+        except Exception:
+            self.setGeometry(target)
+
+    def _toggle_expand(self) -> None:
+        self._is_expanded = not self._is_expanded
+        if self._is_expanded:
+            # Expanded → full ChatGPT-like layout
+            set_button_lucide_icon(self.btn_expand, "minimize-2", 16, "#9a9a9a")
+            if self.btn_expand.icon().isNull():
+                self.btn_expand.setText("🗗")
+            else:
+                self.btn_expand.setText("")
+            self.btn_expand.setToolTip("Collapse to compact")
+            if hasattr(self, "_sidebar"):
+                self._sidebar.setVisible(True)
+            self._apply_compact_header(True)
+            self.setMinimumSize(QSize(760, 560))
+            geo = self._position_expanded_centered()
+            self._animate_to_geometry(geo)
+        else:
+            set_button_lucide_icon(self.btn_expand, "maximize-2", 16, "#9a9a9a")
+            if self.btn_expand.icon().isNull():
+                self.btn_expand.setText("⛶")
+            else:
+                self.btn_expand.setText("")
+            self.btn_expand.setToolTip("Expand to full view")
+            if hasattr(self, "_sidebar"):
+                self._sidebar.setVisible(False)
+            self._apply_compact_header(False)
+            self.setMinimumSize(QSize(380, 420))
+            target = self._compute_compact_geo()
+            self._animate_to_geometry(target)
+        # Reflow messages
+        for row in self._rows:
+            row.fit_height()
 
     # ── Feed helpers ────────────────────────────────────────
     def _add_row(self, role: str, text: str = "") -> _MessageRow:
@@ -792,6 +1383,23 @@ class ResponseWindow(QWidget):
 
     # ── Models ──────────────────────────────────────────────
     def _populate_models(self) -> None:
+        # Free Only + 2+ active → combined random free pool across all providers
+        if self._free_only and len(get_active_provider_ids()) >= 2:
+            pool = collect_free_vision_across_active()
+            if pool:
+                combined = [rec for _, rec in pool]
+                seen: set[str] = set()
+                uniq: list[dict] = []
+                for r in combined:
+                    if r["id"] not in seen:
+                        uniq.append(r)
+                        seen.add(r["id"])
+                self._apply_model_records(uniq)
+                return
+            self.model_select.setEnabled(False)
+            self.model_select.setToolTip("Loading free models from all active providers...")
+            self._fetch_all_active_models()
+            return
         cached = get_cached_records()
         if cached:
             self._apply_model_records(cached)
@@ -803,6 +1411,70 @@ class ResponseWindow(QWidget):
         self._models_fetcher.failed.connect(self._on_models_failed)
         self._models_fetcher.finished.connect(self._models_fetcher.deleteLater)
         self._models_fetcher.start()
+
+    def _fetch_all_active_models(self) -> None:
+        """Fetch models for every Active provider in parallel, then show combined free pool."""
+        from PySide6.QtCore import QThread
+
+        active = get_active_provider_ids()
+        if not active:
+            self.model_select.setEnabled(True)
+            return
+
+        class _AllFetcher(QThread):
+            fetched_all = Signal(list)  # list of (pid, records)
+
+            def __init__(self, pids: list[str]):
+                super().__init__()
+                self.pids = pids
+
+            def run(self) -> None:
+                out: list[tuple[str, list[dict]]] = []
+                for pid in self.pids:
+                    try:
+                        from snipai.ai.models import fetch_models_sync
+                        recs = fetch_models_sync(pid)
+                        out.append((pid, recs))
+                    except Exception:
+                        out.append((pid, []))
+                self.fetched_all.emit(out)
+
+        self._all_fetcher = _AllFetcher(active)
+        self._all_fetcher.fetched_all.connect(self._on_all_fetched)
+        self._all_fetcher.finished.connect(self._all_fetcher.deleteLater)
+        self._all_fetcher.start()
+
+    @Slot(list)
+    def _on_all_fetched(self, all_data: list) -> None:
+        # all_data: list of (pid, records)
+        pool: list[dict] = []
+        for _, recs in all_data:
+            for r in recs:
+                if r.get("free"):
+                    pool.append(r)
+        if not pool:
+            for _, recs in all_data:
+                for r in recs:
+                    if r.get("vision"):
+                        pool.append(r)
+                if pool:
+                    break
+        if not pool:
+            for _, recs in all_data:
+                pool.extend(recs)
+        # Deduplicate
+        seen: set[str] = set()
+        uniq: list[dict] = []
+        for r in pool:
+            if r["id"] not in seen:
+                uniq.append(r)
+                seen.add(r["id"])
+        if uniq:
+            self._apply_model_records(uniq)
+        else:
+            self.model_select.setEnabled(True)
+            self.model_select.setToolTip("No models found")
+        self._all_fetcher = None
 
     def _apply_model_records(self, records: list[dict]) -> None:
         self._model_records = list(records)
@@ -820,10 +1492,20 @@ class ResponseWindow(QWidget):
             self.model_select.addItem(display)
         target = self._current_model
         if self._free_only:
-            from ..ai.models import pick_free_vision
-            free_vision = pick_free_vision()
-            if free_vision:
-                target = free_vision["id"]
+            if len(get_active_provider_ids()) >= 2:
+                rnd = pick_random_free_vision_across_active()
+                if rnd:
+                    target = rnd[1]["id"]
+                else:
+                    for r in records:
+                        if r.get("free"):
+                            target = r["id"]
+                            break
+            else:
+                from ..ai.models import pick_free_vision
+                free_vision = pick_free_vision()
+                if free_vision:
+                    target = free_vision["id"]
         idx = next((i for i, m in enumerate(self._model_records) if m["id"] == target), -1)
         if idx >= 0:
             self.model_select.setCurrentIndex(idx)
@@ -833,7 +1515,10 @@ class ResponseWindow(QWidget):
             self._current_model = self._model_records[0]["id"]
         self.model_select.blockSignals(False)
         self.model_select.setEnabled(True)
-        self.model_select.setToolTip(f"Model: {self._current_model}")
+        if self._free_only and len(get_active_provider_ids()) >= 2:
+            self.model_select.setToolTip(f"Model: {self._current_model} (random free across {len(get_active_provider_ids())} providers)")
+        else:
+            self.model_select.setToolTip(f"Model: {self._current_model}")
 
         has_free = any(m.get("free") for m in self._model_records)
         if not has_free:
@@ -876,7 +1561,18 @@ class ResponseWindow(QWidget):
     @Slot(bool)
     def _on_free_only_toggled(self, on: bool) -> None:
         self._free_only = on
-        if not on or not self._model_records:
+        if not on:
+            cached = get_cached_records()
+            if cached:
+                self._apply_model_records(cached)
+            else:
+                self._populate_models()
+            return
+        if len(get_active_provider_ids()) >= 2:
+            # Show combined free pool from all active providers, random pick
+            self._populate_models()
+            return
+        if not self._model_records:
             return
         from ..ai.models import pick_free_vision
         free_vision = pick_free_vision()
@@ -924,12 +1620,30 @@ class ResponseWindow(QWidget):
         self._status_bar.show()
         self._status_label.setText("Response complete")
         self._status_label.setStyleSheet("")
+        if hasattr(self, "_rate_limit_bar"):
+            self._rate_limit_bar.hide()
 
         if not self._current_buf:
             self._current_buf = "_(empty response)_"
 
         if self._active_row is not None:
             self._active_row.set_markdown(self._current_buf)
+        # Detect rate-limit / quota that was streamed as normal content (fallback)
+        lower_fin = self._current_buf.lower()
+        if (
+            "rate limit" in lower_fin
+            or "tokens per minute" in lower_fin
+            or " 429" in self._current_buf
+            or " 402" in self._current_buf
+            or "credits" in lower_fin
+            or "quota" in lower_fin
+        ):
+            self._status_label.setText("Rate limit / quota exceeded — try another free model")
+            self._status_label.setStyleSheet("color: #fca5a5; font-size: 8pt; font-weight: 600;")
+            if hasattr(self, "_rate_limit_label"):
+                self._rate_limit_label.setText("Limit detected — try another free model")
+            if hasattr(self, "_rate_limit_bar"):
+                self._rate_limit_bar.show()
         self._messages.append({"role": "assistant", "content": self._current_buf})
         self._last_assistant = self._current_buf
         answer = self._current_buf
@@ -950,8 +1664,31 @@ class ResponseWindow(QWidget):
     def mark_failed(self, err: str) -> None:
         self._thinking_bar.hide()
         self._status_bar.show()
-        self._status_label.setText("Error occurred")
-        self._status_label.setStyleSheet("color: #ff6b6b; font-size: 8pt;")
+        lower = err.lower()
+        is_rate = (
+            "rate limit" in lower
+            or "rate_limit" in lower
+            or "tokens per minute" in lower
+            or "429" in err
+            or "402" in err
+            or "credits" in lower
+            or "quota" in lower
+            or "insufficient" in lower
+        )
+        if is_rate:
+            self._status_label.setText("Rate limit / quota exceeded — try another free model")
+            self._status_label.setStyleSheet("color: #fca5a5; font-size: 8pt; font-weight: 600;")
+            if hasattr(self, "_rate_limit_label"):
+                # Show first line of error
+                short = err.splitlines()[0][:140] if err else "Quota exceeded"
+                self._rate_limit_label.setText(f"Limit hit — {short}")
+            if hasattr(self, "_rate_limit_bar"):
+                self._rate_limit_bar.show()
+        else:
+            self._status_label.setText("Error occurred")
+            self._status_label.setStyleSheet("color: #ff6b6b; font-size: 8pt;")
+            if hasattr(self, "_rate_limit_bar"):
+                self._rate_limit_bar.hide()
         if self._active_row is not None:
             self._active_row.set_markdown(
                 (self._current_buf + f"\n\n**Error:** `{err}`").strip()
@@ -970,6 +1707,8 @@ class ResponseWindow(QWidget):
 
     # ── Send ───────────────────────────────────────────────
     def _start_worker(self) -> None:
+        if hasattr(self, "_rate_limit_bar"):
+            self._rate_limit_bar.hide()
         log.info("_start_worker: messages=%d model=%s", len(self._messages), self._current_model)
         self._worker = GeminiWorker.from_messages(list(self._messages), model=self._current_model)
         self._worker.chunk.connect(self.append_chunk)
@@ -978,8 +1717,31 @@ class ResponseWindow(QWidget):
         self._worker.tool_used.connect(self._on_tool_used)
         self._worker.model_switched.connect(self._on_model_switched)
         self._worker.provider_switched.connect(self._on_provider_switched)
+        self._worker.finished.connect(self._on_worker_done)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
+
+    @Slot()
+    def _on_worker_done(self) -> None:
+        # Safety net: worker finished but mark_finished/failed not called (interrupted) → re-enable
+        # Use singleShot to let queued mark_finished/failed run first
+        from PySide6.QtCore import QTimer
+        def _ensure_enabled():
+            if self._worker is not None:
+                log.warning("_on_worker_done: worker still not cleared, forcing enable")
+                self._thinking_bar.hide()
+                self.chat_input.setEnabled(True)
+                self.btn_send.setEnabled(True)
+                self.chat_input.setFocus()
+                self._worker = None
+            self._hide_text_options()
+            # Ensure input is enabled if no worker is running
+            if self._worker is None and not self.chat_input.isEnabled():
+                self.chat_input.setEnabled(True)
+                self.btn_send.setEnabled(True)
+        QTimer.singleShot(60, _ensure_enabled)
+        # Hide text options immediately (they should be gone after first turn)
+        self._hide_text_options()
 
     @Slot(str)
     def _on_model_switched(self, new_model: str) -> None:
@@ -998,7 +1760,8 @@ class ResponseWindow(QWidget):
         if provider_id.startswith("custom:"):
             display = provider_id.replace("custom:", "Custom · ")
         self.provider_badge.setText(display)
-        self.provider_badge.setVisible(True)
+        # Only show badge when expanded; compact keeps header minimal
+        self.provider_badge.setVisible(bool(getattr(self, "_is_expanded", False)))
         self._current_model = model_id
         for i, m in enumerate(self._model_records):
             if m["id"] == model_id:
@@ -1025,9 +1788,15 @@ class ResponseWindow(QWidget):
                 self._add_row("user", f"_Analyzing {n} stacked items together._")
                 self._messages = build_stack_messages(prompt, self._stack_items, system=system)
             elif self._text_mode:
-                # Show the captured selection as the first user row.
+                # Show the captured selection + option cards, wait for user pick (no auto-send)
                 self._add_row("user", self._selected_text)
-                self._messages = build_text_messages(prompt, self._selected_text, system=system)
+                self._show_text_options()
+                self._first_turn_sent = False
+                self.chat_input.setEnabled(True)
+                self.btn_send.setEnabled(True)
+                self._thinking_bar.hide()
+                self._status_bar.hide()
+                return
             else:
                 self._messages = build_initial_messages(prompt, self._png, system=system)
 
@@ -1089,6 +1858,7 @@ class ResponseWindow(QWidget):
     def _on_send(self) -> None:
         if self._worker is not None:
             return
+        self._hide_text_options()
         text = self.chat_input.toPlainText().strip()
         if not text:
             return
@@ -1211,6 +1981,9 @@ class ResponseWindow(QWidget):
 
     def keyPressEvent(self, e: QKeyEvent) -> None:
         if e.key() == Qt.Key.Key_Escape:
+            if hasattr(self, "_chat_stack") and hasattr(self, "_inline_settings") and self._chat_stack.currentWidget() is self._inline_settings:
+                self._hide_inline_settings()
+                return
             self.close()
             return
         super().keyPressEvent(e)

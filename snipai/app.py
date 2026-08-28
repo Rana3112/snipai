@@ -19,7 +19,7 @@ from .capture.overlay import CaptureOverlay
 from .capture.screenshot import grab_virtual_desktop, Snapshot
 from .capture.text_select import grab_selected_text
 from .config import config, init_config, Config
-from .hotkey import HotkeyListener
+from .hotkey import HotkeyListener, TextGrabHotkeyListener
 from .tray import Tray
 from .ui.response_window import ResponseWindow
 from .ui.history_window import HistoryWindow
@@ -52,7 +52,7 @@ class SnipAIApp(QObject):
         self._last_end_t: float = 0.0
 
         self.tray.snip_requested.connect(self.on_snip)
-        self.tray.text_requested.connect(self.on_text_snip)
+        self.tray.text_requested.connect(lambda: self.on_text_snip(from_tray=True))
         self.tray.stack_add_requested.connect(self.on_stack_add)
         self.tray.stack_analyze_requested.connect(self.on_stack_analyze)
         self.tray.watch_requested.connect(self.on_watch)
@@ -91,22 +91,40 @@ class SnipAIApp(QObject):
     def _start_hotkeys(self):
         """Start hotkey listeners. Called after config is loaded."""
         self.hotkey = HotkeyListener(config.HOTKEY)
-        self.text_hotkey = HotkeyListener(config.TEXT_HOTKEY)
+        # TextGrabHotkeyListener uses kernel-level hook — fires before source window
+        # loses focus, immediately sends Ctrl+C while selection is still intact.
+        self.text_hotkey = TextGrabHotkeyListener(config.TEXT_HOTKEY)
         self.hotkey.triggered.connect(self.on_snip)
-        self.text_hotkey.triggered.connect(self.on_text_snip)
+        self.text_hotkey.grabbed.connect(self._on_text_grabbed)
+        self.text_hotkey.failed.connect(
+            lambda: self.tray.notify("SnipAI", "No text selected — highlight text first.")
+        )
         failed = []
-        for listener, name in [(self.hotkey, config.HOTKEY), (self.text_hotkey, config.TEXT_HOTKEY)]:
-            try:
-                listener.start()
-                log.info("Hotkey registered: %s", name)
-            except RuntimeError as e:
-                log.error("Hotkey registration failed: %s", e)
-                failed.append(str(e))
+        try:
+            self.hotkey.start()
+            log.info("Hotkey registered: %s", config.HOTKEY)
+        except RuntimeError as e:
+            log.error("Hotkey registration failed: %s", e)
+            failed.append(str(e))
+        try:
+            self.text_hotkey.start()
+            log.info("Text grab hotkey registered: %s", config.TEXT_HOTKEY)
+        except RuntimeError as e:
+            log.error("Text grab hotkey registration failed: %s", e)
+            failed.append(str(e))
         if failed:
             self.tray.notify(
                 "SnipAI — hotkey conflict",
                 "\n".join(failed[:2]) + "\nUse tray menu or change hotkeys in Settings.",
             )
+
+    @Slot(str)
+    def _on_text_grabbed(self, text: str):
+        """Called on Qt main thread after kernel hook grabbed the text."""
+        if not self._ready():
+            return
+        log.info("Text grab hotkey: got %d chars", len(text))
+        self._open_text_window(text)
 
     # ── Guards ──
     def _ready(self) -> bool:
@@ -136,7 +154,7 @@ class SnipAIApp(QObject):
 
     # ── Text ──
     @Slot()
-    def on_text_snip(self):
+    def on_text_snip(self, from_tray: bool = False):
         if not self._ready():
             return
         for w in list(self._windows):
@@ -144,21 +162,36 @@ class SnipAIApp(QObject):
                 w.close()
             except Exception:
                 pass
-        QTimer.singleShot(0, self._dispatch_text_snip)
+        QTimer.singleShot(0, lambda: self._dispatch_text_snip(from_tray=from_tray))
 
-    def _dispatch_text_snip(self):
+    def _dispatch_text_snip(self, from_tray: bool = False):
         text = ""
-        try:
-            text = grab_selected_text()
-        except Exception:
-            log.exception("text grab failed")
-        log.info("Text snip dispatch: got %d chars", len(text))
-        if text:
-            log.info("Text selection captured (%d chars)", len(text))
-            self._open_text_window(text)
+        if from_tray:
+            # Tray click loses source-window focus and blocks SendInput via UIPI.
+            # Read clipboard directly — user should Ctrl+C their text first.
+            from PySide6.QtGui import QGuiApplication
+            text = QGuiApplication.clipboard().text().strip()
+            log.info("Text snip dispatch (clipboard-direct): got %d chars", len(text))
+            if not text:
+                self.tray.notify(
+                    "SnipAI — no text",
+                    "Copy text first (Ctrl+C in any app), then use Grab selected text.",
+                )
+                self._last_end_t = time.monotonic()
+                return
         else:
-            self.tray.notify("SnipAI", "No text selected — highlight text first.")
-            self._last_end_t = time.monotonic()
+            # Hotkey path: source window still has focus, Ctrl+C simulation works.
+            try:
+                text = grab_selected_text()
+            except Exception:
+                log.exception("text grab failed")
+            log.info("Text snip dispatch (hotkey): got %d chars", len(text))
+            if not text:
+                self.tray.notify("SnipAI", "No text selected — highlight text first.")
+                self._last_end_t = time.monotonic()
+                return
+
+        self._open_text_window(text)
 
     def _open_text_window(self, text: str):
         from PySide6.QtGui import QCursor

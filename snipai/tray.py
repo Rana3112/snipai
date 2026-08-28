@@ -1,25 +1,51 @@
 """System tray icon + menu."""
 from __future__ import annotations
-from PySide6.QtCore import QObject, Signal
+import ctypes
+from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor, QBrush, QFont
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 
 
 def _build_icon() -> QIcon:
-    """Procedurally render simple icon — avoids shipping image asset."""
-    pix = QPixmap(64, 64)
-    pix.fill(QColor(0, 0, 0, 0))
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setBrush(QBrush(QColor(50, 130, 246)))
-    p.setPen(QColor(255, 255, 255))
-    p.drawRoundedRect(4, 4, 56, 56, 12, 12)
-    p.setPen(QColor(255, 255, 255))
-    f = QFont("Segoe UI", 26, QFont.Weight.Bold)
-    p.setFont(f)
-    p.drawText(pix.rect(), 0x84, "AI")  # AlignCenter
-    p.end()
-    return QIcon(pix)
+    """Lucide sparkles on brand gradient — crisp, modern."""
+    try:
+        from .ui.icons import lucide_pixmap
+        pix = QPixmap(64, 64)
+        pix.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Brand gradient background
+        p.setBrush(QBrush(QColor(91, 106, 255)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(4, 4, 56, 56, 12, 12)
+        # Lucide sparkles white, centered
+        icon_pix = lucide_pixmap("sparkles", 36, "#ffffff")
+        if icon_pix is not None and not icon_pix.isNull():
+            x = (64 - icon_pix.width()) // 2
+            y = (64 - icon_pix.height()) // 2
+            p.drawPixmap(x, y, icon_pix)
+        else:
+            p.setPen(QColor(255, 255, 255))
+            f = QFont("Segoe UI", 26, QFont.Weight.Bold)
+            p.setFont(f)
+            p.drawText(pix.rect(), 0x84, "AI")
+        p.end()
+        return QIcon(pix)
+    except Exception:
+        # Fallback procedural
+        pix = QPixmap(64, 64)
+        pix.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(QColor(50, 130, 246)))
+        p.setPen(QColor(255, 255, 255))
+        p.drawRoundedRect(4, 4, 56, 56, 12, 12)
+        p.setPen(QColor(255, 255, 255))
+        f = QFont("Segoe UI", 26, QFont.Weight.Bold)
+        p.setFont(f)
+        p.drawText(pix.rect(), 0x84, "AI")
+        p.end()
+        return QIcon(pix)
 
 
 class Tray(QObject):
@@ -79,10 +105,15 @@ class Tray(QObject):
         act_quit.triggered.connect(self.quit_requested.emit)
         menu.addAction(act_quit)
 
+        self._prev_hwnd: int = 0
+
         self.icon.setContextMenu(menu)
         self.icon.activated.connect(self._on_activate)
 
     def _on_activate(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Context:
+            # Capture before context menu steals foreground
+            self._prev_hwnd = ctypes.windll.user32.GetForegroundWindow()
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.snip_requested.emit()
 
